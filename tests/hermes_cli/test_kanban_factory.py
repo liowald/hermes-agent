@@ -186,6 +186,7 @@ def test_factory_roles_must_be_distinct(factory_env):
                 workspace_kind="dir",
                 workspace_path=str(repo),
                 reviewer_b="reviewer-a",
+                idempotency_key="feature:duplicate-reviewer-role",
             )
     finally:
         conn.close()
@@ -375,6 +376,32 @@ def test_local_commit_review_bundle_is_based_on_factory_intake(factory_env):
         assert bundle["base_sha"] == intake_sha
         assert "-before" in bundle["diff"]
         assert "+committed candidate" in bundle["diff"]
+    finally:
+        conn.close()
+
+
+def test_factory_idempotent_retry_returns_existing_root_after_workspace_changes(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Retry-safe intake", body="Preserve the first receipt.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:lost-create-response",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("implementation in progress\n")
+
+        retried = factory.create_factory(
+            conn, title="Retry-safe intake", body="Preserve the first receipt.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:lost-create-response",
+            delivery_mode="local_commit",
+        )
+
+        assert retried["root_id"] == created["root_id"]
+        assert retried["implement_task_id"] == created["implement_task_id"]
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 1
     finally:
         conn.close()
 

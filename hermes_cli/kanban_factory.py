@@ -201,18 +201,24 @@ def create_factory(
 ) -> dict[str, Any]:
     """Create a guarded root and its first implementation phase."""
     ensure_schema(conn)
-    executor = _profile(executor, "executor")
-    reviewer_a = _profile(reviewer_a, "reviewer-a")
-    reviewer_b = _profile(reviewer_b, "reviewer-b")
-    fixer = _profile(fixer, "fixer")
-    if len({executor, reviewer_a, reviewer_b, fixer}) != 4:
-        raise ValueError("executor, reviewer-a, reviewer-b, and fixer must be distinct profiles")
     request_key = str(idempotency_key or "").strip()
     if not request_key:
         raise ValueError("idempotency_key is required for factory creation")
     delivery_mode = str(delivery_mode or "").strip().lower()
     if delivery_mode not in {"draft_pr", "local_commit"}:
         raise ValueError("delivery_mode must be draft_pr or local_commit")
+    existing = conn.execute(
+        "SELECT root_id FROM factory_workflows WHERE request_key=?", (request_key,)
+    ).fetchone()
+    if existing:
+        return inspect_factory(conn, existing["root_id"])
+
+    executor = _profile(executor, "executor")
+    reviewer_a = _profile(reviewer_a, "reviewer-a")
+    reviewer_b = _profile(reviewer_b, "reviewer-b")
+    fixer = _profile(fixer, "fixer")
+    if len({executor, reviewer_a, reviewer_b, fixer}) != 4:
+        raise ValueError("executor, reviewer-a, reviewer-b, and fixer must be distinct profiles")
     delivery_repo = None
     delivery_base = None
     delivery_base_sha = None
@@ -226,11 +232,6 @@ def create_factory(
     else:
         delivery_base_sha = _workspace_head_sha(source_repo)
     _require_clean_intake_base(source_repo, delivery_base_sha)
-    existing = conn.execute(
-        "SELECT root_id FROM factory_workflows WHERE request_key=?", (request_key,)
-    ).fetchone()
-    if existing:
-        return inspect_factory(conn, existing["root_id"])
     root_key = f"hermes-factory-root:{request_key}"
     phase_key = f"hermes-factory-phase:{request_key}:implement"
     collision = conn.execute(
