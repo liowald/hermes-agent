@@ -590,7 +590,6 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
                     created_by=root_id,
                     workspace_kind="dir",
                     workspace_path=task.workspace_path,
-                    branch_name=task.branch_name,
                     tenant=task.tenant,
                     priority=task.priority,
                     idempotency_key=(

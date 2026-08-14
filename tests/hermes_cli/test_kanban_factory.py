@@ -632,6 +632,45 @@ def test_terminal_invalid_review_retry_preserves_read_only_role(factory_env):
         conn.close()
 
 
+def test_terminal_invalid_worktree_implementation_reuses_checkout(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Retry worktree", body="Keep one executor checkout.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:retry-terminal-worktree",
+            delivery_mode="local_commit",
+        )
+        original = created["implement_task_id"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='worktree',branch_name=? WHERE id=?",
+                (f"reader/{original}", original),
+            )
+        _claim_complete(conn, original, {
+            "inspection_only": True,
+            "changed_files": [],
+            "tests_run": [],
+        })
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+        assert blocked["blocked_from_state"] == "implementing"
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        replacement = retried["implement_task_id"]
+        replacement_task = kb.get_task(conn, replacement)
+        assert retried["state"] == "implementing"
+        assert replacement != original
+        assert replacement_task.assignee == "executor"
+        assert replacement_task.workspace_kind == "dir"
+        assert replacement_task.workspace_path == str(repo)
+        assert replacement_task.branch_name is None
+        assert kb.get_task(conn, original).status == "done"
+    finally:
+        conn.close()
+
+
 def test_completing_state_resumes_idempotently_after_crash(factory_env):
     _, repo = factory_env
     conn = kb.connect()
