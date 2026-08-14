@@ -2431,6 +2431,8 @@ def _get_platform_tools(
     for ts_key, ts_def in TOOLSETS.items():
         if ts_key in skip:
             continue
+        if ts_def.get("internal"):
+            continue
         if ts_def.get("includes"):
             continue
         # Posture toolsets (e.g. ``coding``) are session-level selections made

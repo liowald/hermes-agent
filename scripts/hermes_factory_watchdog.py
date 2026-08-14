@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Cheap deterministic Hermes factory probe and reconciler.
 
-Healthy ticks print nothing.  Stable actionable anomalies are emitted as JSON
-for a monitor-mode Terra job; the model is never invoked on an unchanged or
-healthy snapshot.
+Every tick emits one stable JSON snapshot. The cron monitor owns change
+detection, so an unchanged healthy or anomalous snapshot invokes no model.
+Deployment must seed the initial healthy monitor baseline before enabling the
+job; later transitions alone wake the Terra anomaly reviewer.
 """
 
 from __future__ import annotations

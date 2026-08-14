@@ -162,7 +162,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         initial_cursor = int(kb.list_notify_subs(conn1, tid)[0]["last_event_id"])
         kb.complete_task(conn1, tid, result="ok")
 
-        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+        old_cursor, claimed_cursor, claim_token, events = kb.claim_unseen_events_for_sub(
             conn1,
             task_id=tid,
             platform="telegram",
@@ -175,7 +175,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
 
         # A concurrent notifier instance sees the advanced cursor and cannot
         # claim/send the same event range.
-        _, _, duplicate_events = kb.claim_unseen_events_for_sub(
+        _, _, _, duplicate_events = kb.claim_unseen_events_for_sub(
             conn2,
             task_id=tid,
             platform="telegram",
@@ -191,6 +191,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
             chat_id="123",
             claimed_cursor=claimed_cursor,
             old_cursor=old_cursor,
+            claim_token=claim_token,
         ) is True
         _, retried_events = kb.unseen_events_for_sub(
             conn2,
@@ -1406,5 +1407,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

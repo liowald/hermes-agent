@@ -352,7 +352,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "review_requested",
         )
-        _old, _new, events = kb.claim_unseen_events_for_sub(
+        _old, _new, _token, events = kb.claim_unseen_events_for_sub(
             conn,
             task_id=tid,
             platform="slack",

@@ -188,7 +188,7 @@ def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
             kb._append_event(conn, tid, "completed", {"summary": "done"})
             second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+        old_cursor, claimed_cursor, claim_token, events = kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
         )
         assert [event.id for event in events] == [first, second]
@@ -198,13 +198,14 @@ def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
             platform="buzz",
             chat_id="reader",
             claimed_cursor=claimed_cursor,
+            claim_token=claim_token,
             retry_cursor=first,
             error="unknown mention",
             quarantine_after=2,
         )
         assert (failures, quarantined) == (1, False)
 
-        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+        old_cursor, claimed_cursor, claim_token, events = kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
         )
         assert old_cursor == first
@@ -215,6 +216,7 @@ def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
             platform="buzz",
             chat_id="reader",
             claimed_cursor=claimed_cursor,
+            claim_token=claim_token,
             retry_cursor=first,
             error="unknown mention",
             quarantine_after=2,
@@ -227,7 +229,7 @@ def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
         assert kb.list_notify_subs(conn, tid, include_quarantined=False) == []
         assert kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
-        ) == (0, 0, [])
+        ) == (0, 0, None, [])
 
         # Explicit re-subscribe is the recovery action. It keeps the failed
         # suffix pending and clears only the delivery quarantine.
@@ -236,7 +238,7 @@ def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
         assert sub["last_event_id"] == first
         assert sub["delivery_failures"] == 0
         assert sub["delivery_quarantined_at"] is None
-        old_cursor, _claimed_cursor, events = kb.claim_unseen_events_for_sub(
+        old_cursor, _claimed_cursor, _claim_token, events = kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
         )
         assert old_cursor == first
@@ -254,7 +256,7 @@ def test_notify_claim_lease_prevents_loss_and_late_cursor_rewind(kanban_home):
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "status", {"status": "review"})
             first = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        old, first_claim, events = kb.claim_unseen_events_for_sub(
+        old, first_claim, first_token, events = kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
         )
         assert [event.id for event in events] == [first]
@@ -264,12 +266,13 @@ def test_notify_claim_lease_prevents_loss_and_late_cursor_rewind(kanban_home):
 
         assert kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
-        ) == (old, old, [])
+        ) == (old, old, None, [])
         assert kb.advance_notify_cursor(
             conn, task_id=tid, platform="buzz", chat_id="reader",
             new_cursor=first_claim,
+            claim_token=first_token,
         )
-        old2, second_claim, events2 = kb.claim_unseen_events_for_sub(
+        old2, second_claim, second_token, events2 = kb.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="buzz", chat_id="reader",
         )
         assert old2 == first
@@ -279,13 +282,54 @@ def test_notify_claim_lease_prevents_loss_and_late_cursor_rewind(kanban_home):
         assert not kb.advance_notify_cursor(
             conn, task_id=tid, platform="buzz", chat_id="reader",
             new_cursor=first_claim,
+            claim_token=first_token,
         )
         assert kb.advance_notify_cursor(
             conn, task_id=tid, platform="buzz", chat_id="reader",
             new_cursor=second_claim,
+            claim_token=second_token,
         )
         sub = kb.list_notify_subs(conn, tid)[0]
         assert sub["last_event_id"] == second
+    finally:
+        conn.close()
+
+
+def test_expired_replacement_claim_rejects_stale_same_cursor_owner(kanban_home):
+    """A claim generation, not its cursor, owns failure/success mutations."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="claim generation", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "completed", {"summary": "done"})
+        old, cursor_a, token_a, events_a = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert events_a and token_a
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_claimed_at=0 WHERE task_id=?",
+                (tid,),
+            )
+        old_b, cursor_b, token_b, events_b = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert (old_b, cursor_b) == (old, cursor_a)
+        assert events_b and token_b and token_b != token_a
+
+        assert kb.record_notify_delivery_failure(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            claimed_cursor=cursor_a, claim_token=token_a,
+            retry_cursor=old, error="stale owner",
+        ) == (0, False)
+        assert kb.advance_notify_cursor(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            new_cursor=cursor_b, claim_token=token_b,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == cursor_b
+        assert sub["delivery_failures"] == 0
     finally:
         conn.close()
 

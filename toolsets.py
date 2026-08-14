@@ -399,6 +399,7 @@ TOOLSETS = {
 
     "factory_review_readonly": {
         "description": "Read-only repository inspection plus bounded Kanban review verdicts",
+        "internal": True,
         "tools": [
             "read_file", "search_files",
             "kanban_show", "kanban_complete", "kanban_block",

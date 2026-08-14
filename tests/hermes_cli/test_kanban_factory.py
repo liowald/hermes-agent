@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -319,6 +320,22 @@ def test_factory_intake_binds_delivery_repository_and_base(factory_env):
         conn.close()
 
 
+def test_factory_rejects_dirty_or_non_default_intake(factory_env):
+    _, repo = factory_env
+    (repo / "app.txt").write_text("uncommitted\n")
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="clean checkout at the exact"):
+            factory.create_factory(
+                conn, title="Unsafe base", body="Do not inherit unrelated work.",
+                workspace_kind="dir", workspace_path=str(repo),
+                idempotency_key="feature:unsafe-base",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_concurrent_reconcilers_create_only_one_fixer(factory_env):
     _, repo = factory_env
     conn = kb.connect()
@@ -425,5 +442,63 @@ def test_completing_state_resumes_idempotently_after_crash(factory_env):
         assert done["state"] == "done"
         assert kb.get_task(conn, created["root_id"]).result == raw
         assert factory.reconcile_factory(conn, created["root_id"])["state"] == "done"
+    finally:
+        conn.close()
+
+
+def test_concurrent_terminal_reconcile_cannot_regress_done_root(factory_env, monkeypatch):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Terminal race", body="Complete once.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:terminal-race", delivery_mode="local_commit",
+        )
+        receipt = {
+            "contract": "hermes.factory.receipt.v1",
+            "candidate_sha": "tree",
+            "reviewer_a": "reviewer-a",
+            "reviewer_b": "reviewer-b",
+            "delivery": {"kind": "local_commit"},
+            "delivery_mode": "local_commit",
+            "commit_sha": "a" * 40,
+            "tests_run": ["unit"],
+        }
+        raw = json.dumps(receipt, sort_keys=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE factory_workflows SET state='completing',final_receipt=? WHERE root_id=?",
+                (raw, created["root_id"]),
+            )
+        root_id = created["root_id"]
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(2)
+    real_complete = kb.complete_task
+
+    def synchronized_complete(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return real_complete(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "complete_task", synchronized_complete)
+
+    def reconcile_once():
+        thread_conn = kb.connect()
+        try:
+            return factory.reconcile_factory(thread_conn, root_id)
+        finally:
+            thread_conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: reconcile_once(), range(2)))
+    assert {result["state"] for result in results} == {"done"}
+    conn = kb.connect()
+    try:
+        workflow = factory.inspect_factory(conn, root_id)
+        assert workflow["state"] == "done"
+        assert workflow["last_error"] is None
+        assert kb.get_task(conn, root_id).status == "done"
     finally:
         conn.close()

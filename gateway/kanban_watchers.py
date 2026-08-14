@@ -431,7 +431,7 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    old_cursor, cursor, claim_token, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
@@ -450,6 +450,7 @@ class GatewayKanbanWatchersMixin:
                                         "sub": sub,
                                         "old_cursor": old_cursor,
                                         "cursor": cursor,
+                                        "claim_token": claim_token,
                                         "events": events,
                                         "task": task,
                                         "board": slug,
@@ -478,7 +479,7 @@ class GatewayKanbanWatchersMixin:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance, sub, d["cursor"], d["claim_token"], board_slug,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -502,6 +503,7 @@ class GatewayKanbanWatchersMixin:
                             sub,
                             d["cursor"],
                             d.get("old_cursor", 0),
+                            d["claim_token"],
                             board_slug,
                         )
                         continue
@@ -720,13 +722,14 @@ class GatewayKanbanWatchersMixin:
                                     )
                             last_passive_cursor = int(ev.id)
                             await asyncio.to_thread(
-                                self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                self._kanban_delivery_success, sub, d["claim_token"], board_slug,
                             )
                         except Exception as exc:
                             fails, quarantined = await asyncio.to_thread(
                                 self._kanban_delivery_failure,
                                 sub,
                                 d["cursor"],
+                                d["claim_token"],
                                 last_passive_cursor,
                                 str(exc),
                                 MAX_SEND_FAILURES,
@@ -844,13 +847,14 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                 )
                                 await asyncio.to_thread(
-                                    self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                    self._kanban_delivery_success, sub, d["claim_token"], board_slug,
                                 )
                             except Exception as _wk_err:
                                 fails, quarantined = await asyncio.to_thread(
                                     self._kanban_delivery_failure,
                                     sub,
                                     d["cursor"],
+                                    d["claim_token"],
                                     d.get("old_cursor", 0),
                                     str(_wk_err),
                                     MAX_SEND_FAILURES,
@@ -940,13 +944,14 @@ class GatewayKanbanWatchersMixin:
                             try:
                                 await _push_wake()
                                 await asyncio.to_thread(
-                                    self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                    self._kanban_delivery_success, sub, d["claim_token"], board_slug,
                                 )
                             except Exception as _wk_err:
                                 fails, quarantined = await asyncio.to_thread(
                                     self._kanban_delivery_failure,
                                     sub,
                                     d["cursor"],
+                                    d["claim_token"],
                                     d.get("old_cursor", 0),
                                     str(_wk_err),
                                     MAX_SEND_FAILURES,
@@ -972,13 +977,13 @@ class GatewayKanbanWatchersMixin:
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance, sub, d["cursor"], d["claim_token"], board_slug,
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             await asyncio.to_thread(
-                                self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                self._kanban_delivery_success, sub, d["claim_token"], board_slug,
                             )
                         # Unsubscribe only on archive. Completion (``done``)
                         # remains reversible: controllers reopen completed
@@ -1015,7 +1020,7 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(1)
 
     def _kanban_advance(
-        self, sub: dict, cursor: int, board: Optional[str] = None,
+        self, sub: dict, cursor: int, claim_token: str, board: Optional[str] = None,
     ) -> None:
         """Sync helper: advance a subscription's cursor. Runs in to_thread.
 
@@ -1032,6 +1037,7 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+                claim_token=claim_token,
             )
         finally:
             conn.close()
@@ -1055,6 +1061,7 @@ class GatewayKanbanWatchersMixin:
         sub: dict,
         claimed_cursor: int,
         old_cursor: int,
+        claim_token: str,
         board: Optional[str] = None,
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
@@ -1069,12 +1076,13 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+                claim_token=claim_token,
             )
         finally:
             conn.close()
 
     def _kanban_delivery_success(
-        self, sub: dict, claimed_cursor: int, board: Optional[str] = None,
+        self, sub: dict, claim_token: str, board: Optional[str] = None,
     ) -> None:
         """Clear persisted retry evidence after one successful delivery."""
         from hermes_cli import kanban_db as _kb
@@ -1086,7 +1094,7 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
+                claim_token=claim_token,
             )
         finally:
             conn.close()
@@ -1095,6 +1103,7 @@ class GatewayKanbanWatchersMixin:
         self,
         sub: dict,
         claimed_cursor: int,
+        claim_token: str,
         retry_cursor: int,
         error: str,
         quarantine_after: int,
@@ -1111,6 +1120,7 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
+                claim_token=claim_token,
                 retry_cursor=retry_cursor,
                 error=error,
                 quarantine_after=quarantine_after,

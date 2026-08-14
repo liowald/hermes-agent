@@ -47,6 +47,7 @@ def ensure_schema(conn) -> None:
             delivery_mode       TEXT NOT NULL DEFAULT 'draft_pr',
             delivery_repo       TEXT,
             delivery_base       TEXT,
+            delivery_base_sha   TEXT,
             implement_task_id   TEXT NOT NULL,
             reviewer_a_task_id  TEXT,
             reviewer_b_task_id  TEXT,
@@ -88,6 +89,8 @@ def ensure_schema(conn) -> None:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN delivery_repo TEXT")
     if "delivery_base" not in columns:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN delivery_base TEXT")
+    if "delivery_base_sha" not in columns:
+        conn.execute("ALTER TABLE factory_workflows ADD COLUMN delivery_base_sha TEXT")
     if "blocked_from_state" not in columns:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN blocked_from_state TEXT")
     conn.execute(
@@ -104,8 +107,8 @@ def _profile(name: str, role: str) -> str:
     return value
 
 
-def _workspace_delivery_target(path: Path) -> tuple[str, str]:
-    """Return the immutable GitHub repository slug and configured base."""
+def _workspace_delivery_target(path: Path) -> tuple[str, str, str]:
+    """Return the GitHub repository, default branch, and local base ref SHA."""
     origin_url = subprocess.run(
         ["git", "remote", "get-url", "origin"],
         cwd=path,
@@ -128,7 +131,29 @@ def _workspace_delivery_target(path: Path) -> tuple[str, str]:
     prefix = "origin/"
     if not origin_head.startswith(prefix) or len(origin_head) == len(prefix):
         raise ValueError("workspace origin default branch is unavailable")
-    return repo, origin_head[len(prefix):]
+    base = origin_head[len(prefix):]
+    base_sha = subprocess.run(
+        ["git", "rev-parse", f"refs/remotes/origin/{base}"],
+        cwd=path, text=True, capture_output=True, check=True, timeout=15,
+    ).stdout.strip()
+    return repo, base, base_sha
+
+
+def _require_clean_intake_base(path: Path, expected_sha: str) -> None:
+    """Reject a factory seeded from a dirty or non-default checkout."""
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, text=True,
+        capture_output=True, check=True, timeout=15,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1"], cwd=path, text=True,
+        capture_output=True, check=True, timeout=30,
+    ).stdout.strip()
+    if head != expected_sha or status:
+        raise ValueError(
+            "draft_pr factory intake requires a clean checkout at the exact "
+            "origin default-branch commit"
+        )
 
 
 def _factory_source_repo(
@@ -182,13 +207,15 @@ def create_factory(
         raise ValueError("delivery_mode must be draft_pr or local_commit")
     delivery_repo = None
     delivery_base = None
+    delivery_base_sha = None
     if delivery_mode == "draft_pr":
         source_repo = _factory_source_repo(workspace_path, project_id)
         if source_repo is None:
             raise ValueError(
                 "draft_pr factories require a repository workspace or project"
             )
-        delivery_repo, delivery_base = _workspace_delivery_target(source_repo)
+        delivery_repo, delivery_base, delivery_base_sha = _workspace_delivery_target(source_repo)
+        _require_clean_intake_base(source_repo, delivery_base_sha)
     existing = conn.execute(
         "SELECT root_id FROM factory_workflows WHERE request_key=?", (request_key,)
     ).fetchone()
@@ -271,13 +298,13 @@ def create_factory(
             conn.execute(
                 "INSERT INTO factory_workflows "
                 "(root_id,request_key,contract_version,state,cycle,executor_profile,reviewer_a_profile,"
-                "reviewer_b_profile,fixer_profile,delivery_mode,delivery_repo,delivery_base,"
+                "reviewer_b_profile,fixer_profile,delivery_mode,delivery_repo,delivery_base,delivery_base_sha,"
                 "implement_task_id,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     root_id, request_key, FACTORY_VERSION, "implementing", 0, executor,
                     reviewer_a, reviewer_b, fixer, delivery_mode, delivery_repo,
-                    delivery_base, implement_id, now, now,
+                    delivery_base, delivery_base_sha, implement_id, now, now,
                 ),
             )
             kb._append_event(
@@ -379,7 +406,9 @@ def _workspace_tree_sha(path: Path) -> str:
             pass
 
 
-def _candidate_bundle(workspace: str, root_id: str, cycle: int) -> tuple[str, str, list[str]]:
+def _candidate_bundle(
+    workspace: str, root_id: str, cycle: int, base_sha: Optional[str] = None,
+) -> tuple[str, str, list[str]]:
     path = Path(workspace).expanduser().resolve()
     if not path.is_dir():
         raise ValueError(f"implementation workspace is unavailable: {path}")
@@ -391,8 +420,16 @@ def _candidate_bundle(workspace: str, root_id: str, cycle: int) -> tuple[str, st
         ["git", "rev-parse", "HEAD"], cwd=path, text=True,
         capture_output=True, check=True, timeout=30,
     ).stdout.strip()
+    diff_base = base_sha or "HEAD"
+    if base_sha:
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_sha, "HEAD"],
+            cwd=path, capture_output=True, timeout=30,
+        )
+        if ancestry.returncode != 0:
+            raise ValueError("workspace HEAD is not descended from the factory intake base")
     diff = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"], cwd=path, text=True,
+        ["git", "diff", "--binary", diff_base], cwd=path, text=True,
         capture_output=True, check=True, timeout=60,
     ).stdout
     staged = subprocess.run(
@@ -405,6 +442,7 @@ def _candidate_bundle(workspace: str, root_id: str, cycle: int) -> tuple[str, st
         "cycle": cycle,
         "workspace": str(path),
         "head": head,
+        "base_sha": base_sha,
         "status": status.splitlines(),
         "diff": diff,
         "staged_diff": staged,
@@ -417,7 +455,12 @@ def _candidate_bundle(workspace: str, root_id: str, cycle: int) -> tuple[str, st
     bundle = out / f"cycle-{cycle}-{candidate[:12]}.json"
     bundle.write_bytes(encoded)
     os.chmod(bundle, 0o600)
-    changed = [line[3:] for line in status.splitlines() if len(line) > 3]
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", diff_base], cwd=path, text=True,
+        capture_output=True, check=True, timeout=30,
+    ).stdout.splitlines()
+    changed.extend(line[3:] for line in status.splitlines() if len(line) > 3)
+    changed = list(dict.fromkeys(changed))
     return candidate, str(bundle), changed
 
 
@@ -452,12 +495,13 @@ def _create_review_task(conn, row, *, profile: str, label: str, candidate: str, 
 def _set_error(conn, root_id: str, message: str) -> dict[str, Any]:
     now = int(time.time())
     with kb.write_txn(conn):
-        conn.execute(
+        cur = conn.execute(
             "UPDATE factory_workflows SET blocked_from_state=CASE WHEN state!='blocked' THEN state ELSE blocked_from_state END,"
-            "state='blocked',last_error=?,updated_at=? WHERE root_id=?",
+            "state='blocked',last_error=?,updated_at=? WHERE root_id=? AND state!='done'",
             (message[:2000], now, root_id),
         )
-        kb._append_event(conn, root_id, "factory_blocked", {"reason": message[:2000]})
+        if cur.rowcount:
+            kb._append_event(conn, root_id, "factory_blocked", {"reason": message[:2000]})
     return inspect_factory(conn, root_id)
 
 
@@ -506,6 +550,7 @@ def _promote_reviews(conn, row, receipt: dict) -> dict[str, Any]:
     try:
         candidate, bundle, observed = _candidate_bundle(
             implement.workspace_path, row["root_id"], int(row["cycle"]),
+            row["delivery_base_sha"],
         )
     except Exception as exc:
         return _set_error(conn, row["root_id"], f"candidate capture failed: {exc}")
@@ -513,12 +558,15 @@ def _promote_reviews(conn, row, receipt: dict) -> dict[str, Any]:
         return _set_error(conn, row["root_id"], "implementation has no observed diff or commit receipt")
     if row["delivery_mode"] == "draft_pr":
         try:
-            repo, base = _workspace_delivery_target(
+            repo, base, base_sha = _workspace_delivery_target(
                 Path(implement.workspace_path).expanduser().resolve()
             )
         except Exception as exc:
             return _set_error(conn, row["root_id"], f"delivery target verification failed: {exc}")
-        if repo != row["delivery_repo"] or base != row["delivery_base"]:
+        if (
+            repo != row["delivery_repo"] or base != row["delivery_base"]
+            or base_sha != row["delivery_base_sha"]
+        ):
             return _set_error(
                 conn, row["root_id"],
                 "workspace delivery target changed after factory intake",
@@ -710,7 +758,13 @@ def _finish_root(conn, row) -> dict[str, Any]:
             conn, row["root_id"], result=raw, summary="Factory delivery verified",
             metadata=receipt, fire_lifecycle_hook=True,
         ):
-            return _set_error(conn, row["root_id"], "verified root completion failed")
+            # Another reconciler may have won the root CAS between our read
+            # and complete_task(). Treat an exact factory receipt as the same
+            # successful terminal transition, never as a reason to regress a
+            # verified root into blocked state.
+            observed = kb.get_task(conn, row["root_id"])
+            if observed is None or observed.status != "done" or observed.result != raw:
+                return _set_error(conn, row["root_id"], "verified root completion failed")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE factory_workflows SET state='done',updated_at=? WHERE root_id=?",
@@ -872,12 +926,15 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
             return _set_error(conn, root_id, "delivery receipt does not match authorized mode")
         if row["delivery_mode"] == "draft_pr":
             try:
-                repo, base = _workspace_delivery_target(workspace)
+                repo, base, base_sha = _workspace_delivery_target(workspace)
             except Exception as exc:
                 return _set_error(
                     conn, root_id, f"delivery target verification failed: {exc}"
                 )
-            if repo != row["delivery_repo"] or base != row["delivery_base"]:
+            if (
+                repo != row["delivery_repo"] or base != row["delivery_base"]
+                or base_sha != row["delivery_base_sha"]
+            ):
                 return _set_error(
                     conn, root_id,
                     "workspace delivery target changed after factory intake",

@@ -1523,6 +1523,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_quarantined_at INTEGER,
     delivery_claim_cursor INTEGER,
     delivery_claimed_at INTEGER,
+    delivery_claim_token TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -2768,6 +2769,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_claimed_at", "delivery_claimed_at INTEGER"
             )
+        if "delivery_claim_token" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claim_token", "delivery_claim_token TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2895,7 +2900,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, delivery_failures INTEGER NOT NULL DEFAULT 0,"
         " delivery_last_error TEXT, delivery_quarantined_at INTEGER,"
-        " delivery_claim_cursor INTEGER, delivery_claimed_at INTEGER,"
+        " delivery_claim_cursor INTEGER, delivery_claimed_at INTEGER, delivery_claim_token TEXT,"
         " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
@@ -11156,7 +11161,7 @@ def add_notify_sub(
         conn.execute(
             "UPDATE kanban_notify_subs SET delivery_failures=0,"
             "delivery_last_error=NULL,delivery_quarantined_at=NULL,"
-            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
             "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
             (task_id, platform, chat_id, thread_id or ""),
         )
@@ -11423,10 +11428,10 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
-) -> tuple[int, int, list[Event]]:
+) -> tuple[int, int, Optional[str], list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
-    Returns ``(old_cursor, claim_cursor, events)``. The durable delivered
+    Returns ``(old_cursor, claim_cursor, claim_token, events)``. The durable delivered
     cursor does not move until :func:`advance_notify_cursor` succeeds with the
     matching claim. This in-flight lease prevents a second watcher from
     claiming later events while the first is still sending, which otherwise
@@ -11434,14 +11439,14 @@ def claim_unseen_events_for_sub(
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT last_event_id,delivery_claim_cursor,delivery_claimed_at "
+            "SELECT last_event_id,delivery_claim_cursor,delivery_claimed_at,delivery_claim_token "
             "FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND delivery_quarantined_at IS NULL",
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
-            return 0, 0, []
+            return 0, 0, None, []
         old_cursor = int(row["last_event_id"])
         now = int(time.time())
         lease_cutoff = now - 300
@@ -11449,7 +11454,7 @@ def claim_unseen_events_for_sub(
             row["delivery_claim_cursor"] is not None
             and int(row["delivery_claimed_at"] or 0) >= lease_cutoff
         ):
-            return old_cursor, old_cursor, []
+            return old_cursor, old_cursor, None, []
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -11459,19 +11464,21 @@ def claim_unseen_events_for_sub(
             kinds=kinds,
         )
         if not events:
-            return old_cursor, old_cursor, []
+            return old_cursor, old_cursor, None, []
+        claim_token = secrets.token_hex(16)
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET delivery_claim_cursor=?,delivery_claimed_at=? "
+            "UPDATE kanban_notify_subs SET delivery_claim_cursor=?,delivery_claimed_at=?,"
+            "delivery_claim_token=? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id=? AND (delivery_claim_cursor IS NULL OR delivery_claimed_at<?)",
             (
-                int(new_cursor), now, task_id, platform, chat_id,
+                int(new_cursor), now, claim_token, task_id, platform, chat_id,
                 thread_id or "", int(old_cursor), lease_cutoff,
             ),
         )
         if cur.rowcount != 1:
-            return old_cursor, old_cursor, []
-        return old_cursor, new_cursor, events
+            return old_cursor, old_cursor, None, []
+        return old_cursor, new_cursor, claim_token, events
 
 
 def advance_notify_cursor(
@@ -11482,16 +11489,17 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
+    claim_token: str,
 ) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id=?,"
-            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_claim_cursor=?",
+            "AND delivery_claim_cursor=? AND delivery_claim_token=?",
             (
                 int(new_cursor), task_id, platform, chat_id,
-                thread_id or "", int(new_cursor),
+                thread_id or "", int(new_cursor), str(claim_token),
             ),
         )
     return cur.rowcount > 0
@@ -11506,6 +11514,7 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    claim_token: str,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
@@ -11514,12 +11523,12 @@ def rewind_notify_cursor(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id=?,"
-            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_claim_cursor = ?",
+            "AND delivery_claim_cursor = ? AND delivery_claim_token = ?",
             (
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
-                int(claimed_cursor),
+                int(claimed_cursor), str(claim_token),
             ),
         )
     return cur.rowcount > 0
@@ -11532,7 +11541,7 @@ def record_notify_delivery_success(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
-    claimed_cursor: Optional[int] = None,
+    claim_token: Optional[str] = None,
 ) -> None:
     """Clear persisted transient failure evidence after a delivered event."""
     with write_txn(conn):
@@ -11541,10 +11550,10 @@ def record_notify_delivery_success(
             "delivery_last_error=NULL "
             "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
             "AND delivery_quarantined_at IS NULL "
-            "AND (? IS NULL OR delivery_claim_cursor=?)",
+            "AND (? IS NULL OR delivery_claim_token=?)",
             (
                 task_id, platform, chat_id, thread_id or "",
-                claimed_cursor, claimed_cursor,
+                claim_token, claim_token,
             ),
         )
 
@@ -11557,6 +11566,7 @@ def record_notify_delivery_failure(
     chat_id: str,
     thread_id: Optional[str] = None,
     claimed_cursor: int,
+    claim_token: str,
     retry_cursor: int,
     error: str,
     quarantine_after: int = 12,
@@ -11580,12 +11590,12 @@ def record_notify_delivery_failure(
             "WHEN COALESCE(delivery_failures,0)+1>=? "
             "THEN COALESCE(delivery_quarantined_at,?) "
             "ELSE delivery_quarantined_at END,"
-            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
             "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
-            "AND delivery_claim_cursor=?",
+            "AND delivery_claim_cursor=? AND delivery_claim_token=?",
             (
                 int(retry_cursor), message, limit, now, task_id, platform,
-                chat_id, thread_id or "", int(claimed_cursor),
+                chat_id, thread_id or "", int(claimed_cursor), str(claim_token),
             ),
         )
         row = conn.execute(
