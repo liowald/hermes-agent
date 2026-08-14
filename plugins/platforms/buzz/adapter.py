@@ -1484,6 +1484,23 @@ def interactive_setup() -> None:
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
+_BUZZ_CHANNEL_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+
+def _parse_buzz_target(target_ref: str) -> Optional[tuple[str, Optional[str]]]:
+    value = str(target_ref or "").strip()
+    if _BUZZ_CHANNEL_RE.fullmatch(value):
+        return value.lower(), None
+    return None
+
+
+def _validate_buzz_target(target_ref: str) -> bool | str:
+    return True if _BUZZ_CHANNEL_RE.fullmatch(str(target_ref or "")) else "expected a channel UUID"
+
+
 def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1506,6 +1523,10 @@ def register(ctx):
         apply_yaml_config_fn=_apply_yaml_config,
         # Cron home-channel delivery support (deliver=buzz).
         cron_deliver_env_var="BUZZ_HOME_CHANNEL",
+        # Buzz channel ids are UUIDs. Accept an explicit UUID even when the
+        # asynchronously-built channel directory has not discovered it yet.
+        parse_target_ref_fn=_parse_buzz_target,
+        validate_target_ref_fn=_validate_buzz_target,
         # Out-of-process cron delivery.  Without this hook, deliver=buzz
         # cron jobs fail with "No live adapter" when cron runs separately
         # from the gateway.

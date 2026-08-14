@@ -509,3 +509,34 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+class TestTaskPinnedWorkerLifecycleToolset:
+    def test_readonly_factory_reviewer_does_not_gain_full_kanban(self, monkeypatch):
+        import model_tools
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim")
+        monkeypatch.setattr(model_tools, "_is_dispatcher_owned_worker", lambda: True)
+        monkeypatch.setattr(model_tools, "_is_delegated_child_context", lambda: False)
+        monkeypatch.setattr(
+            model_tools.registry,
+            "get_definitions",
+            lambda names, quiet=False: [
+                {"function": {"name": name}} for name in sorted(names)
+            ],
+        )
+
+        names = {
+            item["function"]["name"]
+            for item in model_tools._compute_tool_definitions(
+                enabled_toolsets=["factory_review_readonly"],
+                quiet_mode=True,
+            )
+        }
+
+        assert {"read_file", "search_files", "kanban_complete", "kanban_block"} <= names
+        assert not {
+            "kanban_create", "kanban_link", "kanban_attach", "write_file", "patch", "terminal",
+        } & names

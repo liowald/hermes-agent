@@ -1093,6 +1093,9 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    # Dispatcher-enforced capability pin for this task. Unlike profile prose,
+    # this becomes an explicit ``--toolsets`` argument at spawn time.
+    worker_toolsets: Optional[list] = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -1204,6 +1207,11 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            worker_toolsets=(
+                json.loads(row["worker_toolsets"])
+                if "worker_toolsets" in keys and row["worker_toolsets"]
+                else None
+            ),
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
                 row["provider_override"]
@@ -1374,6 +1382,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    worker_toolsets      TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1509,6 +1518,11 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
+    delivery_failures INTEGER NOT NULL DEFAULT 0,
+    delivery_last_error TEXT,
+    delivery_quarantined_at INTEGER,
+    delivery_claim_cursor INTEGER,
+    delivery_claimed_at INTEGER,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -2577,6 +2591,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
+    if "worker_toolsets" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_toolsets", "worker_toolsets TEXT")
 
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
@@ -2726,6 +2742,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "delivery_failures" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_failures",
+                "delivery_failures INTEGER NOT NULL DEFAULT 0",
+            )
+        if "delivery_last_error" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_last_error", "delivery_last_error TEXT"
+            )
+        if "delivery_quarantined_at" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_quarantined_at",
+                "delivery_quarantined_at INTEGER",
+            )
+        if "delivery_claim_cursor" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claim_cursor", "delivery_claim_cursor INTEGER"
+            )
+        if "delivery_claimed_at" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claimed_at", "delivery_claimed_at INTEGER"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2851,7 +2893,10 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " delivery_metadata TEXT, delivery_failures INTEGER NOT NULL DEFAULT 0,"
+        " delivery_last_error TEXT, delivery_quarantined_at INTEGER,"
+        " delivery_claim_cursor INTEGER, delivery_claimed_at INTEGER,"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -3146,6 +3191,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3356,6 +3402,14 @@ def create_task(
             )
         skills_list = cleaned
 
+    worker_toolsets_list: Optional[list[str]] = None
+    if worker_toolsets is not None:
+        worker_toolsets_list = list(dict.fromkeys(
+            str(name).strip() for name in worker_toolsets if str(name).strip()
+        ))
+        if not worker_toolsets_list:
+            raise ValueError("worker_toolsets must contain at least one toolset")
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3458,10 +3512,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, worker_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3480,6 +3534,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(worker_toolsets_list) if worker_toolsets_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
@@ -3512,6 +3567,7 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "worker_toolsets": list(worker_toolsets_list) if worker_toolsets_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -10465,7 +10521,7 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = task.worker_toolsets or _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -11002,6 +11058,11 @@ def add_notify_sub(
     messages (issue #29905). Subscribers only want events that occur
     AFTER they subscribe; the gateway/tool auto-subscribe paths run at
     task creation, where the snapshot is 0 anyway.
+
+    Re-subscribing is also the explicit recovery action for a quarantined
+    destination. It preserves the failed-event cursor while clearing the
+    persisted failure state, so the next notifier tick retries exactly the
+    undelivered suffix rather than replaying the whole history.
     """
     insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
         # api_server is stateless: the adapter has no send() — the wake
@@ -11092,6 +11153,13 @@ def add_notify_sub(
                 """,
                 (metadata_json, task_id, platform, chat_id, thread_id or ""),
             )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_failures=0,"
+            "delivery_last_error=NULL,delivery_quarantined_at=NULL,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
 
 
 def _notify_profile_filter(
@@ -11130,6 +11198,7 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_quarantined: bool = True,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -11149,6 +11218,8 @@ def list_notify_subs(
     if owner_where:
         where.append(owner_where)
         params.extend(owner_params)
+    if not include_quarantined:
+        where.append("delivery_quarantined_at IS NULL")
     sql = "SELECT * FROM kanban_notify_subs"
     if where:
         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
@@ -11170,6 +11241,7 @@ def count_notify_subs(
     board: Optional[str] = None,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_quarantined: bool = True,
     platform: Optional[str] = None,
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
@@ -11208,6 +11280,8 @@ def count_notify_subs(
             if owner_where:
                 clauses.append(f"({owner_where})")
                 params.extend(owner_params)
+            if not include_quarantined:
+                clauses.append("delivery_quarantined_at IS NULL")
             if platform is not None:
                 clauses.append("LOWER(platform) = LOWER(?)")
                 params.append(platform)
@@ -11352,27 +11426,30 @@ def claim_unseen_events_for_sub(
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
-    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
-    ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
-    processes pointed at the same board DB: concurrent watchers serialize on
-    SQLite's writer lock, and only the first process sees and claims a given
-    event range.
-
-    Callers should send the claimed events, then either leave the cursor at
-    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
-    failed before any terminal unsubscribe removed the row.
+    Returns ``(old_cursor, claim_cursor, events)``. The durable delivered
+    cursor does not move until :func:`advance_notify_cursor` succeeds with the
+    matching claim. This in-flight lease prevents a second watcher from
+    claiming later events while the first is still sending, which otherwise
+    permits both event loss and a late-success cursor rewind.
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            "SELECT last_event_id,delivery_claim_cursor,delivery_claimed_at "
+            "FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_quarantined_at IS NULL",
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
+        now = int(time.time())
+        lease_cutoff = now - 300
+        if (
+            row["delivery_claim_cursor"] is not None
+            and int(row["delivery_claimed_at"] or 0) >= lease_cutoff
+        ):
+            return old_cursor, old_cursor, []
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -11383,12 +11460,17 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_claim_cursor=?,delivery_claimed_at=? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "AND last_event_id=? AND (delivery_claim_cursor IS NULL OR delivery_claimed_at<?)",
+            (
+                int(new_cursor), now, task_id, platform, chat_id,
+                thread_id or "", int(old_cursor), lease_cutoff,
+            ),
         )
+        if cur.rowcount != 1:
+            return old_cursor, old_cursor, []
         return old_cursor, new_cursor, events
 
 
@@ -11400,13 +11482,19 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
-) -> None:
+) -> bool:
     with write_txn(conn):
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_claim_cursor=?",
+            (
+                int(new_cursor), task_id, platform, chat_id,
+                thread_id or "", int(new_cursor),
+            ),
         )
+    return cur.rowcount > 0
 
 
 def rewind_notify_cursor(
@@ -11421,21 +11509,95 @@ def rewind_notify_cursor(
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
-    The CAS guard only rewinds if no later notifier advanced the row after our
-    claim. This keeps retry behavior for transient send failures without
-    clobbering newer progress.
+    The CAS guard releases only the matching in-flight lease.
     """
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
+            "AND delivery_claim_cursor = ?",
             (
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
         )
     return cur.rowcount > 0
+
+
+def record_notify_delivery_success(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: Optional[int] = None,
+) -> None:
+    """Clear persisted transient failure evidence after a delivered event."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_failures=0,"
+            "delivery_last_error=NULL "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+            "AND delivery_quarantined_at IS NULL "
+            "AND (? IS NULL OR delivery_claim_cursor=?)",
+            (
+                task_id, platform, chat_id, thread_id or "",
+                claimed_cursor, claimed_cursor,
+            ),
+        )
+
+
+def record_notify_delivery_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    retry_cursor: int,
+    error: str,
+    quarantine_after: int = 12,
+) -> tuple[int, bool]:
+    """Rewind a failed claim and persist a bounded delivery quarantine.
+
+    ``retry_cursor`` is the last event that actually delivered from the
+    claimed batch. The failed suffix stays pending. Once the bounded retry
+    budget is exhausted, the subscription remains durable but is excluded
+    from notifier polling until an explicit re-subscribe clears quarantine.
+    """
+    limit = max(1, int(quarantine_after))
+    now = int(time.time())
+    message = str(error or "delivery failed")[:500]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_failures=COALESCE(delivery_failures,0)+1,"
+            "delivery_last_error=?,"
+            "delivery_quarantined_at=CASE "
+            "WHEN COALESCE(delivery_failures,0)+1>=? "
+            "THEN COALESCE(delivery_quarantined_at,?) "
+            "ELSE delivery_quarantined_at END,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+            "AND delivery_claim_cursor=?",
+            (
+                int(retry_cursor), message, limit, now, task_id, platform,
+                chat_id, thread_id or "", int(claimed_cursor),
+            ),
+        )
+        row = conn.execute(
+            "SELECT delivery_failures,delivery_quarantined_at "
+            "FROM kanban_notify_subs WHERE task_id=? AND platform=? "
+            "AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+    if cur.rowcount == 0 or row is None:
+        return 0, False
+    failures = int(row["delivery_failures"] or 0)
+    return failures, row["delivery_quarantined_at"] is not None
 
 
 # ---------------------------------------------------------------------------

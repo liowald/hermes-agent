@@ -410,11 +410,19 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
+        has_worker_lifecycle = any(
+            {"kanban_complete", "kanban_block"}.issubset(
+                set(resolve_toolset(toolset_name))
+            )
+            for toolset_name in effective_enabled_toolsets
+            if validate_toolset(toolset_name)
+        )
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and _is_dispatcher_owned_worker()
             and "kanban" not in effective_enabled_toolsets
+            and not has_worker_lifecycle
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee

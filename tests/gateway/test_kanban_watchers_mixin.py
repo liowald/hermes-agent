@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import GatewayKanbanWatchersMixin, _worker_identity_tag
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -25,4 +25,9 @@ def test_mixin_defines_kanban_methods():
     for m in KANBAN_METHODS:
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
 
+
+def test_buzz_worker_attribution_is_not_a_member_mention():
+    assert _worker_identity_tag("buzz", "executor") == "[executor] "
+    assert "@executor" not in _worker_identity_tag("buzz", "executor")
+    assert _worker_identity_tag("discord", "executor") == "@executor "
 

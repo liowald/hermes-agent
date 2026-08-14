@@ -25,6 +25,13 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _worker_identity_tag(platform: str, profile: Optional[str]) -> str:
+    """Render attribution without inventing a platform-native mention."""
+    if not profile:
+        return ""
+    return f"[{profile}] " if str(platform).lower() == "buzz" else f"@{profile} "
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -217,7 +224,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "factory_blocked")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -232,21 +239,11 @@ class GatewayKanbanWatchersMixin:
         # task is archived lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
-        # consecutive send failures the sub is dropped so we don't spin
-        # against a dead chat every 5 seconds forever.
-        # Raised from 3 to 12 (~60s at the 5s tick cadence): now that a
-        # reported SendResult(success=False) also lands here (see the
-        # delivery loop below), a transient Telegram/API outage of a few
-        # ticks must NOT permanently unsubscribe a live review-gate channel.
-        # A genuinely dead chat still drops, just ~60s later — a fine trade
-        # for an unattended gate where a false drop means silent work pileup.
+        # A failed destination gets 12 persisted attempts (~60s at the 5s
+        # cadence), then enters a durable quarantine. The subscription and
+        # failed cursor survive for inspection/recovery, but a dead chat cannot
+        # trigger an infinite replay loop or erase the return path.
         MAX_SEND_FAILURES = 12
-        sub_fail_counts: dict[tuple, int] = getattr(
-            self, "_kanban_sub_fail_counts", {}
-        )
-        self._kanban_sub_fail_counts = sub_fail_counts
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -355,6 +352,7 @@ class GatewayKanbanWatchersMixin:
                                 board=slug,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
+                                include_quarantined=False,
                             ) == 0:
                                 logger.debug(
                                     "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
@@ -411,6 +409,7 @@ class GatewayKanbanWatchersMixin:
                                 conn,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
+                                include_quarantined=False,
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -508,14 +507,6 @@ class GatewayKanbanWatchersMixin:
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
-                    # Per-subscription failure-counter key. Hoisted out of the
-                    # event loop: the wake self-post path (in the loop's
-                    # ``else`` clause) needs it even when every event in the
-                    # claim was skipped before reaching the send site.
-                    sub_key = (
-                        sub["task_id"], sub["platform"],
-                        sub["chat_id"], sub.get("thread_id") or "",
-                    )
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
@@ -524,13 +515,21 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    # If a later event in this claimed batch fails, rewind
+                    # only to the last event that was actually delivered.
+                    # Rewinding to the batch's original cursor replays earlier
+                    # successful messages forever behind one poison event.
+                    last_passive_cursor = int(d.get("old_cursor", 0) or 0)
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
+                        # Buzz treats an ``@name`` prefix as a real member
+                        # mention and rejects unknown worker-profile names.
+                        # Profiles are attribution, not platform identities.
+                        tag = _worker_identity_tag(platform_str, who)
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -615,6 +614,14 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind == "factory_blocked":
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:200]}"
+                            msg = (
+                                f"🛑 {board_tag}{tag}Factory {sub['task_id']} blocked"
+                                f" — operator action required{reason}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -623,6 +630,7 @@ class GatewayKanbanWatchersMixin:
                             # archive needs no user ping, and unblocked is an
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
+                            last_passive_cursor = int(ev.id)
                             continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -710,36 +718,37 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
+                            last_passive_cursor = int(ev.id)
+                            await asyncio.to_thread(
+                                self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                            )
                         except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
+                            fails, quarantined = await asyncio.to_thread(
+                                self._kanban_delivery_failure,
+                                sub,
+                                d["cursor"],
+                                last_passive_cursor,
+                                str(exc),
+                                MAX_SEND_FAILURES,
+                                board_slug,
+                            )
                             logger.warning(
                                 "kanban notifier: send failed for %s on %s "
                                 "(attempt %d/%d): %s",
                                 sub["task_id"], platform_str, fails,
                                 MAX_SEND_FAILURES, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
-                                    sub["task_id"], platform_str, fails,
+                            if quarantined:
+                                logger.error(
+                                    "kanban notifier: quarantining failed delivery "
+                                    "for %s on %s; preserving subscription and cursor",
+                                    sub["task_id"], platform_str,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
-                            else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
-                                )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
+                            # A delivery error must never erase the durable
+                            # return path. Keep the subscription and rewind the
+                            # claimed cursor; diagnostics can surface the
+                            # repeated failure while a later tick/restart can
+                            # recover it.
                             break
                     else:
                         # All text pings delivered (or intentionally skipped
@@ -834,34 +843,30 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                 )
-                                sub_fail_counts.pop(sub_key, None)
+                                await asyncio.to_thread(
+                                    self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                )
                             except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
+                                fails, quarantined = await asyncio.to_thread(
+                                    self._kanban_delivery_failure,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    str(_wk_err),
+                                    MAX_SEND_FAILURES,
+                                    board_slug,
+                                )
                                 logger.warning(
                                     "kanban notifier: wake self-post failed "
                                     "for %s (attempt %d/%d): %s",
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
-                                    # is NOT lost.
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
+                                if quarantined:
+                                    logger.error(
+                                        "kanban notifier: quarantining wake failure "
+                                        "for %s on %s; subscription preserved",
+                                        sub["task_id"], platform_str,
                                     )
                                 continue
 
@@ -934,34 +939,30 @@ class GatewayKanbanWatchersMixin:
                             # (api_server) self-post ordering above.
                             try:
                                 await _push_wake()
-                                sub_fail_counts.pop(sub_key, None)
+                                await asyncio.to_thread(
+                                    self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                                )
                             except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
+                                fails, quarantined = await asyncio.to_thread(
+                                    self._kanban_delivery_failure,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    str(_wk_err),
+                                    MAX_SEND_FAILURES,
+                                    board_slug,
+                                )
                                 logger.warning(
                                     "kanban notifier: wake-only delivery failed "
                                     "for %s (attempt %d/%d): %s",
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the wake — the event is
-                                    # NOT lost.
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
+                                if quarantined:
+                                    logger.error(
+                                        "kanban notifier: quarantining wake-only failure "
+                                        "for %s on %s; subscription preserved",
+                                        sub["task_id"], platform_str,
                                     )
                                 continue
 
@@ -976,7 +977,9 @@ class GatewayKanbanWatchersMixin:
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
-                            sub_fail_counts.pop(sub_key, None)
+                            await asyncio.to_thread(
+                                self._kanban_delivery_success, sub, d["cursor"], board_slug,
+                            )
                         # Unsubscribe only on archive. Completion (``done``)
                         # remains reversible: controllers reopen completed
                         # work for review corrections and continuation. The
@@ -1066,6 +1069,51 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_success(
+        self, sub: dict, claimed_cursor: int, board: Optional[str] = None,
+    ) -> None:
+        """Clear persisted retry evidence after one successful delivery."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.record_notify_delivery_success(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claimed_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_failure(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        retry_cursor: int,
+        error: str,
+        quarantine_after: int,
+        board: Optional[str] = None,
+    ) -> tuple[int, bool]:
+        """Persist one failed delivery, its retry cursor, and quarantine."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.record_notify_delivery_failure(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claimed_cursor,
+                retry_cursor=retry_cursor,
+                error=error,
+                quarantine_after=quarantine_after,
             )
         finally:
             conn.close()

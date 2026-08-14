@@ -1481,6 +1481,109 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_factory_create(args: dict, **kw) -> str:
+    """Create one guarded coding factory root from an L1/Buzz request."""
+    delegated_err = _reject_delegated_child_mutation("kanban_factory_create")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_factory_create")
+    if guard:
+        return guard
+    title = str(args.get("title") or "").strip()
+    body = str(args.get("body") or "").strip()
+    if not title or not body:
+        return tool_error("title and body are required")
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_factory as factory
+
+        _, conn = _connect(board=board)
+        try:
+            receipt = factory.create_factory(
+                conn,
+                title=title,
+                body=body,
+                workspace_kind=str(args.get("workspace_kind") or "worktree"),
+                workspace_path=args.get("workspace_path"),
+                project_id=args.get("project") or args.get("project_id"),
+                executor=str(args.get("executor") or "executor"),
+                reviewer_a=str(args.get("reviewer_a") or "reviewer-a"),
+                reviewer_b=str(args.get("reviewer_b") or "reviewer-b"),
+                fixer=str(args.get("fixer") or "fixer"),
+                priority=int(args.get("priority") or 0),
+                tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
+                idempotency_key=args.get("idempotency_key"),
+                created_by=os.environ.get("HERMES_PROFILE") or "l1",
+                delivery_mode=str(args.get("delivery_mode") or "draft_pr"),
+            )
+            subscribed = _maybe_auto_subscribe(conn, receipt["root_id"])
+            return _ok(
+                root_id=receipt["root_id"],
+                state=receipt["state"],
+                implement_task_id=receipt["implement_task_id"],
+                contract_version=receipt["contract_version"],
+                subscribed=subscribed,
+                next_gate="implementation receipt",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_factory_create: {e}")
+    except Exception as e:
+        logger.exception("kanban_factory_create failed")
+        return tool_error(f"kanban_factory_create: {e}")
+
+
+def _handle_factory_show(args: dict, **kw) -> str:
+    root_id = str(args.get("root_id") or "").strip()
+    if not root_id:
+        return tool_error("root_id is required")
+    try:
+        from hermes_cli import kanban_factory as factory
+
+        _, conn = _connect(board=args.get("board"))
+        try:
+            return json.dumps({"ok": True, **factory.inspect_factory(conn, root_id)})
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_factory_show: {e}")
+    except Exception as e:
+        logger.exception("kanban_factory_show failed")
+        return tool_error(f"kanban_factory_show: {e}")
+
+
+def _handle_factory_retry(args: dict, **kw) -> str:
+    """Resume a blocked factory through the same bounded Buzz/L1 surface."""
+    delegated_err = _reject_delegated_child_mutation("kanban_factory_retry")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_factory_retry")
+    if guard:
+        return guard
+    root_id = str(args.get("root_id") or "").strip()
+    if not root_id:
+        return tool_error("root_id is required")
+    try:
+        from hermes_cli import kanban_factory as factory
+
+        _, conn = _connect(board=args.get("board"))
+        try:
+            receipt = factory.retry_factory(conn, root_id)
+            return _ok(
+                root_id=receipt["root_id"],
+                state=receipt["state"],
+                next_gate="factory reconciliation",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_factory_retry: {e}")
+    except Exception as e:
+        logger.exception("kanban_factory_retry failed")
+        return tool_error(f"kanban_factory_retry: {e}")
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -2348,6 +2451,69 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_FACTORY_CREATE_SCHEMA = {
+    "name": "kanban_factory_create",
+    "description": (
+        "Queue a durable coding feature through the guarded SDLC factory. "
+        "The returned root id is the human-facing receipt. The root cannot "
+        "complete until implementation, two independent exact-candidate "
+        "reviews, any fixer cycle, and final delivery evidence all pass."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "body": {"type": "string", "description": "Acceptance criteria and authorized delivery scope."},
+            "workspace_kind": {"type": "string", "enum": ["worktree", "dir"]},
+            "workspace_path": {"type": "string"},
+            "project": {"type": "string"},
+            "executor": {"type": "string"},
+            "reviewer_a": {"type": "string"},
+            "reviewer_b": {"type": "string"},
+            "fixer": {"type": "string"},
+            "priority": {"type": "integer"},
+            "tenant": {"type": "string"},
+            "idempotency_key": {"type": "string"},
+            "delivery_mode": {
+                "type": "string",
+                "enum": ["draft_pr", "local_commit"],
+                "description": "Authorized terminal receipt. Defaults to draft_pr.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["title", "body", "idempotency_key"],
+    },
+}
+
+KANBAN_FACTORY_SHOW_SCHEMA = {
+    "name": "kanban_factory_show",
+    "description": "Read the truthful current factory state, phase ids, candidate, and next gate.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "root_id": {"type": "string"},
+            "board": _board_schema_prop(),
+        },
+        "required": ["root_id"],
+    },
+}
+
+KANBAN_FACTORY_RETRY_SCHEMA = {
+    "name": "kanban_factory_retry",
+    "description": (
+        "Resume a blocked factory after its reported phase problem has been corrected. "
+        "Returns the durable root state; it never bypasses review or delivery gates."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "root_id": {"type": "string"},
+            "board": _board_schema_prop(),
+        },
+        "required": ["root_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2459,6 +2625,33 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_factory_create",
+    toolset="kanban",
+    schema=KANBAN_FACTORY_CREATE_SCHEMA,
+    handler=_handle_factory_create,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🏭",
+)
+
+registry.register(
+    name="kanban_factory_show",
+    toolset="kanban",
+    schema=KANBAN_FACTORY_SHOW_SCHEMA,
+    handler=_handle_factory_show,
+    check_fn=_check_kanban_mode,
+    emoji="🏭",
+)
+
+registry.register(
+    name="kanban_factory_retry",
+    toolset="kanban",
+    schema=KANBAN_FACTORY_RETRY_SCHEMA,
+    handler=_handle_factory_retry,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔁",
 )
 
 registry.register(

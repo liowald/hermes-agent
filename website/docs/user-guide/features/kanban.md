@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_factory_create`, `kanban_factory_show`, `kanban_factory_retry`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -68,6 +68,46 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Guarded coding factory
+
+Use the factory when a coding request must not become human-visible `done`
+after a single worker phase:
+
+```bash
+hermes kanban factory create \
+  --title "Add the export flow" \
+  --body "Acceptance criteria and authorized delivery scope" \
+  --workspace dir:/absolute/repository/path \
+  --idempotency-key feature:add-export
+```
+
+The returned root id is the durable receipt. The controller creates separate
+cards for the executor, reviewer A, reviewer B, fixer (only when either review
+requests changes), and final delivery. Reviewers receive a read-only toolset
+and must approve the same content fingerprint. A fix creates a new fingerprint
+and invalidates both prior approvals. A persistent SQLite trigger rejects any
+attempt to complete the root before the delivery receipt passes.
+
+Inspect or advance the deterministic controller with:
+
+```bash
+hermes kanban factory show ROOT_ID --json
+hermes kanban factory reconcile ROOT_ID --json
+hermes kanban factory retry ROOT_ID --json
+```
+
+Factory creation requires an idempotency key and one authorized delivery mode.
+`draft_pr` requires an open GitHub draft PR whose reported head matches the
+reviewed Git tree. `local_commit` requires the clean local `HEAD` to have that
+same tree. A blocked phase emits `factory_blocked`; after correcting its cause,
+`factory retry` resumes the existing phase instead of creating another writer.
+
+For chat-originated work, `kanban_factory_create` auto-subscribes the source
+conversation and returns the root id, current state, implementation phase id,
+and next gate. The same orchestrator can call `kanban_factory_retry` after the
+reported blocker is corrected. Heartbeats and child completions are phase
+evidence only; they are never a factory completion receipt.
 
 ## Boards (multi-project)
 
@@ -888,6 +928,13 @@ bot> ✓ t_9fc1a3 completed by transcriber
 ```
 
 Subscriptions survive a task reaching `done` — completion is reversible (a reviewer or controller can reopen a done task), so the origin session keeps getting notified through reopen cycles. They auto-remove on `archived` (the irreversible end state). On boards that never archive, a GC sweep purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days (default 30; set 0 to disable), so stale rows don't accumulate forever. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
+
+Delivery failures never delete a subscription. Hermes retries a bounded number
+of times, preserves the first failed event cursor, and then quarantines the
+destination so a permanent error cannot replay earlier successes forever.
+`notify-list --json` exposes the failure count, last error, and quarantine time.
+After fixing the target, run `notify-subscribe` again with the same routing
+tuple; this clears quarantine and retries only the undelivered suffix.
 
 A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
 
