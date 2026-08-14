@@ -58,6 +58,7 @@ def ensure_schema(conn) -> None:
             final_receipt       TEXT,
             last_error          TEXT,
             blocked_from_state  TEXT,
+            retry_attempt       INTEGER NOT NULL DEFAULT 0,
             created_at          INTEGER NOT NULL,
             updated_at          INTEGER NOT NULL
         );
@@ -93,6 +94,10 @@ def ensure_schema(conn) -> None:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN delivery_base_sha TEXT")
     if "blocked_from_state" not in columns:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN blocked_from_state TEXT")
+    if "retry_attempt" not in columns:
+        conn.execute(
+            "ALTER TABLE factory_workflows ADD COLUMN retry_attempt INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_factory_request_key "
         "ON factory_workflows(request_key) WHERE request_key IS NOT NULL"
@@ -518,7 +523,7 @@ def _set_error(conn, root_id: str, message: str) -> dict[str, Any]:
 
 
 def retry_factory(conn, root_id: str) -> dict[str, Any]:
-    """Explicitly retry a blocked phase without inventing new ownership."""
+    """Retry a blocked phase while preserving its role and workspace ownership."""
     ensure_schema(conn)
     row = conn.execute("SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)).fetchone()
     if row is None:
@@ -532,20 +537,102 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
         "fixing": ("fixer_task_id",),
         "delivering": ("delivery_task_id",),
     }
-    for field in phase_fields.get(prior, ()):
-        task_id = row[field]
-        task = kb.get_task(conn, task_id) if task_id else None
-        if task and task.status in {"blocked", "scheduled"}:
-            if not kb.unblock_task(conn, task.id):
-                raise ValueError(f"could not unblock phase {task.id}")
-        elif task and task.status == "triage":
-            raise ValueError(f"phase {task.id} is in triage and needs manual repair")
+    fields = phase_fields.get(prior)
+    if not fields:
+        raise ValueError(f"factory state {prior!r} is not retryable")
+
+    replacements: dict[str, str] = {}
     with kb.write_txn(conn):
+        current = conn.execute(
+            "SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)
+        ).fetchone()
+        if (
+            current is None or current["state"] != "blocked"
+            or current["blocked_from_state"] != prior
+        ):
+            raise ValueError("factory retry was already claimed by another controller")
+        attempt = int(current["retry_attempt"] or 0) + 1
+        for field in fields:
+            task_id = current[field]
+            task = kb.get_task(conn, task_id) if task_id else None
+            if task is None:
+                raise ValueError(f"phase field {field} has no recoverable task")
+            if task.status in _TERMINAL:
+                if prior == "delivering":
+                    retry_contract = (
+                        "Complete with candidate_sha, non-empty tests_run, git_status, "
+                        "commit_sha, and delivery.kind exactly "
+                        f"{current['delivery_mode']!r}."
+                    )
+                elif prior == "reviewing":
+                    retry_contract = (
+                        "Complete with verdict, the exact candidate_sha, findings, and "
+                        "non-empty verification metadata."
+                    )
+                else:
+                    retry_contract = (
+                        "Complete with inspection_only=false plus non-empty changed_files "
+                        "and tests_run metadata."
+                    )
+                body = (
+                    f"{task.body or ''}\n\n"
+                    f"Factory retry attempt {attempt}. The prior terminal receipt was "
+                    "rejected by the deterministic controller: "
+                    f"{current['last_error'] or 'invalid receipt'}. "
+                    "Preserve the approved workspace bytes and role boundary. Complete this "
+                    f"replacement phase using this exact metadata contract: {retry_contract}"
+                )
+                replacement = kb.create_task(
+                    conn,
+                    title=f"{task.title} (retry {attempt})",
+                    body=body,
+                    assignee=task.assignee,
+                    created_by=root_id,
+                    workspace_kind="dir",
+                    workspace_path=task.workspace_path,
+                    branch_name=task.branch_name,
+                    tenant=task.tenant,
+                    priority=task.priority,
+                    idempotency_key=(
+                        f"factory:{root_id}:retry:{prior}:{attempt}:{field}"
+                    ),
+                    max_runtime_seconds=task.max_runtime_seconds,
+                    skills=task.skills,
+                    max_retries=task.max_retries,
+                    model_override=task.model_override,
+                    provider_override=task.provider_override,
+                    reasoning_effort=task.reasoning_effort,
+                    goal_mode=False,
+                    initial_status="running",
+                    session_id=task.session_id,
+                    project_id=task.project_id,
+                    worker_toolsets=task.worker_toolsets,
+                )
+                replacements[field] = replacement
+            elif task.status in {"blocked", "scheduled"}:
+                if not kb.unblock_task(conn, task.id, allow_nested=True):
+                    raise ValueError(f"could not unblock phase {task.id}")
+            elif task.status == "triage":
+                raise ValueError(f"phase {task.id} is in triage and needs manual repair")
+
+        assignments = [
+            "state=?", "blocked_from_state=NULL", "last_error=NULL",
+            "retry_attempt=?", "updated_at=?",
+        ]
+        values: list[Any] = [prior, attempt, int(time.time())]
+        for field, replacement in replacements.items():
+            assignments.append(f"{field}=?")
+            values.append(replacement)
+        values.append(root_id)
         conn.execute(
-            "UPDATE factory_workflows SET state=?,blocked_from_state=NULL,last_error=NULL,updated_at=? WHERE root_id=?",
-            (prior, int(time.time()), root_id),
+            f"UPDATE factory_workflows SET {','.join(assignments)} WHERE root_id=?",
+            values,
         )
-        kb._append_event(conn, root_id, "factory_retried", {"state": prior})
+        kb._append_event(conn, root_id, "factory_retried", {
+            "state": prior,
+            "attempt": attempt,
+            "replacement_tasks": replacements,
+        })
     return reconcile_factory(conn, root_id)
 
 
@@ -676,7 +763,8 @@ def _create_delivery(conn, row) -> str:
             "Do not change the approved implementation. Run the final local gate and "
             "prepare the task's authorized delivery (for example a draft PR when the "
             "root requests one). Complete with candidate_sha, tests_run, git_status, "
-            "commit_sha, and delivery metadata. If delivery is not authorized, block."
+            "commit_sha, and a non-empty delivery object whose kind is exactly the "
+            "authorized delivery mode shown above. If delivery is not authorized, block."
         ),
         assignee=row["executor_profile"],
         created_by=row["root_id"],

@@ -108,7 +108,9 @@ exact `origin/HEAD` commit.
 `draft_pr` requires an open GitHub draft PR whose reported head matches the
 reviewed Git tree. `local_commit` requires the clean local `HEAD` to have that
 same tree. A blocked phase emits `factory_blocked`; after correcting its cause,
-`factory retry` resumes the existing phase instead of creating another writer.
+`factory retry` resumes a nonterminal phase. If a terminal phase supplied an
+invalid receipt, retry creates exactly one replacement card with the same role
+and workspace while retaining the rejected card as audit evidence.
 
 For chat-originated work, `kanban_factory_create` auto-subscribes the source
 conversation and returns the root id, current state, implementation phase id,

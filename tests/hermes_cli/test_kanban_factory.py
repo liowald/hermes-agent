@@ -511,6 +511,127 @@ def test_blocked_phase_is_visible_and_explicitly_retryable(factory_env):
         conn.close()
 
 
+def test_terminal_invalid_delivery_retries_with_one_replacement(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Retry receipt", body="Deliver one reviewed commit.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:retry-terminal-receipt",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("after\n")
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+        })
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        candidate = reviewing["candidate_sha"]
+        for task_id in (
+            reviewing["reviewer_a_task_id"], reviewing["reviewer_b_task_id"],
+        ):
+            _claim_complete(conn, task_id, {
+                "verdict": "approve",
+                "candidate_sha": candidate,
+                "findings": [],
+                "verification": ["bundle inspected"],
+            })
+        delivering = factory.reconcile_factory(conn, created["root_id"])
+        original_delivery = delivering["delivery_task_id"]
+        original_task = kb.get_task(conn, original_delivery)
+        assert "whose kind is exactly" in original_task.body
+        subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "change app"], cwd=repo,
+            check=True, capture_output=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        _claim_complete(conn, original_delivery, {
+            "candidate_sha": candidate,
+            "tests_run": ["unit"],
+            "git_status": "clean",
+            "commit_sha": head,
+            "delivery": {"mode": "local_commit", "receipt": "wrong key"},
+        })
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+        assert blocked["blocked_from_state"] == "delivering"
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        replacement = retried["delivery_task_id"]
+        assert retried["state"] == "delivering"
+        assert replacement != original_delivery
+        assert kb.get_task(conn, original_delivery).status == "done"
+        replacement_task = kb.get_task(conn, replacement)
+        assert replacement_task.status == "ready"
+        assert replacement_task.workspace_path == original_task.workspace_path
+        assert "delivery receipt does not match authorized mode" in replacement_task.body
+        assert "delivery.kind exactly 'local_commit'" in replacement_task.body
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?",
+            (f"factory:{created['root_id']}:retry:delivering:%",),
+        ).fetchone()[0] == 1
+
+        _claim_complete(conn, replacement, {
+            "candidate_sha": candidate,
+            "tests_run": ["unit"],
+            "git_status": "clean",
+            "commit_sha": head,
+            "delivery": {"kind": "local_commit", "receipt": "ok"},
+        })
+        done = factory.reconcile_factory(conn, created["root_id"])
+        assert done["state"] == "done"
+        assert kb.get_task(conn, created["root_id"]).status == "done"
+    finally:
+        conn.close()
+
+
+def test_terminal_invalid_review_retry_preserves_read_only_role(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Retry review", body="Keep reviewer capabilities bounded.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:retry-terminal-review",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("after\n")
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+        })
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        original_a = reviewing["reviewer_a_task_id"]
+        original_b = reviewing["reviewer_b_task_id"]
+        _claim_complete(conn, original_a, {
+            "verdict": "approve",
+            "candidate_sha": reviewing["candidate_sha"],
+            "findings": [],
+            "verification": [],
+        })
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        replacement_a = retried["reviewer_a_task_id"]
+        assert retried["state"] == "reviewing"
+        assert replacement_a != original_a
+        assert retried["reviewer_b_task_id"] == original_b
+        assert kb.get_task(conn, replacement_a).worker_toolsets == [
+            "factory_review_readonly"
+        ]
+        assert kb.get_task(conn, original_b).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_completing_state_resumes_idempotently_after_crash(factory_env):
     _, repo = factory_env
     conn = kb.connect()

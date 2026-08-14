@@ -6854,7 +6854,9 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, allow_nested: bool = False,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -6865,7 +6867,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
