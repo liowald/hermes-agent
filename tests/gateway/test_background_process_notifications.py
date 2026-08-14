@@ -8,6 +8,8 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
 
 import asyncio
+import queue
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -64,6 +66,17 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
     if thread_id:
         d["thread_id"] = thread_id
     return d
+
+
+def _watch_event(session_id="proc_watch", thread_id="42"):
+    return {
+        "type": "watch_match",
+        "session_id": session_id,
+        "session_key": f"agent:main:telegram:dm:123:{thread_id}",
+        "pattern": "READY",
+        "command": "build",
+        "output": "READY\n",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +215,54 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_post_turn_watch_drain_off_consumes_without_injecting(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event("proc_one"))
+    completion_queue.put(_watch_event("proc_two"))
+    async_event = {"type": "async_delegation", "session_id": "delegate_one"}
+    completion_queue.put(async_event)
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    adapter.handle_message.assert_not_awaited()
+    assert completion_queue.qsize() == 1
+    assert completion_queue.get_nowait() is async_event
+
+
+@pytest.mark.asyncio
+async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkeypatch, tmp_path):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:dm:123:42"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            thread_id="42",
+            user_id="proc_owner",
+            user_name="alice",
+        )
+    )
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event())
+    async_event = {"type": "async_delegation", "session_id": "delegate_one"}
+    completion_queue.put(async_event)
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.source.thread_id == "42"
+    assert synth_event.source.user_id == "proc_owner"
+    assert completion_queue.qsize() == 1
+    assert completion_queue.get_nowait() is async_event
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
@@ -230,6 +291,46 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id == "777"
     assert synth_event.source.thread_id == "24296"
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatch, tmp_path):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:dm:123:24296"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            thread_id="24296",
+            user_id="1",
+            user_name="Fabio",
+        )
+    )
+    loop_thread = threading.get_ident()
+    load_threads = []
+    real_ensure_loaded = runner.session_store._ensure_loaded
+
+    def spy_ensure_loaded():
+        load_threads.append(threading.get_ident())
+        return real_ensure_loaded()
+
+    monkeypatch.setattr(runner.session_store, "_ensure_loaded", spy_ensure_loaded)
+
+    await runner._inject_watch_notification(
+        "[SYSTEM: Background process matched]",
+        {
+            "session_id": "proc_watch",
+            "session_key": "agent:main:telegram:dm:123:24296",
+            "message_id": "777",
+        },
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    assert load_threads
+    assert all(thread_id != loop_thread for thread_id in load_threads)
 
 
 @pytest.mark.asyncio
@@ -477,3 +578,38 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
     assert posts == ["raw-origin-sid"]
+
+
+def test_gateway_drain_retains_and_formats_overflow_events():
+    """watch_overflow_* events must survive the gateway drain and render
+    their summary — previously they were discarded at the drain (only
+    watch_match/watch_disabled were retained) and had no formatter branch."""
+    import asyncio
+    from gateway.run import (
+        _drain_gateway_watch_events,
+        _format_gateway_process_notification,
+    )
+
+    queue = asyncio.Queue()
+    tripped = {
+        "type": "watch_overflow_tripped",
+        "message": "watch flood detected: 47 notifications suppressed for pattern 'ERROR'",
+        "session_id": "proc_a1b2",
+    }
+    released = {
+        "type": "watch_overflow_released",
+        "message": "watch flood released: notifications resumed for pattern 'ERROR'",
+        "session_id": "proc_a1b2",
+    }
+    queue.put_nowait(tripped)
+    queue.put_nowait(released)
+
+    retained = _drain_gateway_watch_events(queue)
+    assert retained == [tripped, released]
+
+    out_tripped = _format_gateway_process_notification(tripped)
+    assert "47 notifications suppressed" in out_tripped
+    assert "exit code" not in out_tripped
+    out_released = _format_gateway_process_notification(released)
+    assert "notifications resumed" in out_released
+    assert "exit code" not in out_released
