@@ -98,6 +98,56 @@ WantedBy=default.target
 
 
 class TestSystemdUnitIsCurrent:
+    def test_caller_specific_path_drift_does_not_stale_unit(
+        self, tmp_path, monkeypatch,
+    ):
+        from hermes_cli import gateway as gw
+
+        installed = """[Service]
+Environment="PATH=/opt/hermes/bin:/usr/bin"
+Restart=always
+"""
+        expected = installed.replace(
+            "/opt/hermes/bin:/usr/bin",
+            "/opt/hermes/bin:/home/test/.local/share/mise/shims:/usr/bin",
+        )
+        unit_file = tmp_path / "hermes-gateway.service"
+        unit_file.write_text(installed)
+
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        monkeypatch.setattr(
+            gw,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: expected,
+        )
+
+        assert gw.systemd_unit_is_current(system=False) is True
+
+    def test_path_normalization_does_not_mask_same_line_environment_drift(
+        self, tmp_path, monkeypatch,
+    ):
+        from hermes_cli import gateway as gw
+
+        installed = """[Service]
+Environment="PATH=/usr/bin" "LD_PRELOAD=/tmp/foreign.so"
+Restart=always
+"""
+        expected = """[Service]
+Environment="PATH=/usr/bin"
+Restart=always
+"""
+        unit_file = tmp_path / "hermes-gateway.service"
+        unit_file.write_text(installed)
+
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        monkeypatch.setattr(
+            gw,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: expected,
+        )
+
+        assert gw.systemd_unit_is_current(system=False) is False
+
     def test_unit_without_fatal_config_restart_policy_is_not_current(
         self, tmp_path, monkeypatch,
     ):
