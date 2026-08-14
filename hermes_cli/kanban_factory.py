@@ -282,7 +282,8 @@ def create_factory(
                 f"Factory root: {root_id}\n\n{body}\n\n"
                 "Implement the requested change in the isolated workspace. Do not review "
                 "your own work. Before completing this phase, run the relevant local gates. "
-                "Complete with metadata containing non-empty changed_files and tests_run, "
+                "Do not call request-review: the factory creates separate reviewer cards. "
+                "Call complete with metadata containing non-empty changed_files and tests_run, "
                 "inspection_only=false, and delivery evidence if already available."
             )
             implement_id = kb.create_task(
@@ -647,7 +648,8 @@ def _create_fixer(conn, row, findings: list) -> str:
             f"Factory root: {row['root_id']}\nRejected candidate: {row['candidate_sha']}\n\n"
             f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
             "You are the only writer after review. Address every finding, run local "
-            "gates, and complete with inspection_only=false plus non-empty "
+            "gates, and do not call request-review: the factory creates new reviewer "
+            "cards. Call complete with inspection_only=false plus non-empty "
             "changed_files and tests_run metadata. Do not review your own repair."
         ),
         assignee=row["fixer_profile"],

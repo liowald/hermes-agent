@@ -126,6 +126,34 @@ def test_factory_root_rejects_false_completion_and_requires_dual_quorum(factory_
         conn.close()
 
 
+def test_factory_phase_rejects_ordinary_same_card_review_handoff(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Separate review cards", body="Keep factory review isolated.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:no-same-card-review",
+            delivery_mode="local_commit",
+        )
+        task_id = created["implement_task_id"]
+        claimed = kb.claim_task(conn, task_id, claimer="factory-executor")
+        assert claimed is not None
+
+        ok, reason = kb.request_review(
+            conn, task_id, summary="I should not review myself.",
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+
+        assert not ok
+        assert "must call complete or block" in reason
+        assert "separate reviewer cards" in reason
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.latest_run(conn, task_id).status == "running"
+    finally:
+        conn.close()
+
+
 def test_review_changes_routes_only_to_fixer_and_invalidates_prior_approvals(factory_env):
     _, repo = factory_env
     conn = kb.connect()

@@ -6475,6 +6475,30 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        factory_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='factory_workflows'"
+        ).fetchone()
+        if factory_table is not None:
+            factory_phase = conn.execute(
+                "SELECT root_id, "
+                "CASE WHEN implement_task_id=? THEN 'implementation' "
+                "WHEN fixer_task_id=? THEN 'fixer' "
+                "WHEN delivery_task_id=? THEN 'delivery' "
+                "WHEN reviewer_a_task_id=? THEN 'reviewer-a' "
+                "WHEN reviewer_b_task_id=? THEN 'reviewer-b' END AS role "
+                "FROM factory_workflows WHERE ? IN "
+                "(implement_task_id,fixer_task_id,delivery_task_id,"
+                "reviewer_a_task_id,reviewer_b_task_id) LIMIT 1",
+                (task_id, task_id, task_id, task_id, task_id, task_id),
+            ).fetchone()
+            if factory_phase is not None:
+                return _ret(
+                    False,
+                    "guarded factory phase "
+                    f"{factory_phase['role']!r} must call complete or block; "
+                    "the factory creates separate reviewer cards",
+                )
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (

@@ -88,6 +88,9 @@ requests changes), and final delivery. Reviewers receive a read-only toolset
 and must approve the same content fingerprint. A fix creates a new fingerprint
 and invalidates both prior approvals. A persistent SQLite trigger rejects any
 attempt to complete the root before the delivery receipt passes.
+Factory implementation and fixer cards finish with `complete`; the ordinary
+same-card `request-review` transition is rejected because it would bypass the
+two separate reviewer cards.
 
 Inspect or advance the deterministic controller with:
 
