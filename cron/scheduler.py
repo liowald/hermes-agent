@@ -3279,7 +3279,9 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(
+    job: dict, live_delivery_platforms: Optional[set[str]] = None,
+) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
@@ -3301,6 +3303,10 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     if not platform_parts:
         return None
 
+    live_delivery_platforms = {
+        str(name).strip().lower() for name in (live_delivery_platforms or set())
+        if str(name).strip()
+    }
     connected: Optional[set] = None
     for platform_name in platform_parts:
         if not _is_known_delivery_platform(platform_name):
@@ -3309,6 +3315,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if platform_name.lower() in live_delivery_platforms:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config
@@ -3389,7 +3397,9 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict, cfg: dict, *, live_delivery_platforms: Optional[set[str]] = None,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -3408,7 +3418,10 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        (
+            "delivery",
+            lambda: _preflight_check_delivery(job, live_delivery_platforms),
+        ),
     ):
         try:
             reason = check()
@@ -3425,6 +3438,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
+    live_delivery_platforms: Optional[set[str]] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -4088,7 +4102,10 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job, _cfg,
+                    live_delivery_platforms=live_delivery_platforms,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -4886,10 +4903,16 @@ def run_one_job(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _live_delivery_platforms = {
+            str(getattr(platform, "value", platform)).strip().lower()
+            for platform in (adapters or {})
+            if str(getattr(platform, "value", platform)).strip()
+        }
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents,
                 extra_prompt=extra_prompt,
+                live_delivery_platforms=_live_delivery_platforms,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

@@ -66,6 +66,28 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_passes_live_adapter_platforms_to_preflight(monkeypatch):
+    observed = {}
+
+    def fake_run_job(job, *, defer_agent_teardown=None, **kwargs):
+        observed["platforms"] = kwargs.get("live_delivery_platforms")
+        return (True, "out", "final", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *args, **kwargs: None)
+
+    class BuzzPlatform:
+        value = "buzz"
+
+    assert s.run_one_job(
+        {"id": "j-live-buzz", "name": "watcher"},
+        adapters={BuzzPlatform(): object()},
+    )
+    assert observed["platforms"] == {"buzz"}
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -107,5 +129,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 
