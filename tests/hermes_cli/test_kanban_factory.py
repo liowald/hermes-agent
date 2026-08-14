@@ -59,6 +59,268 @@ def _claim_complete(conn, task_id, metadata):
     )
 
 
+def test_work_root_intake_and_atomic_plan_adoption_keep_one_identity(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        first = factory.create_work_root(
+            conn,
+            title="rough feature idea",
+            body="make app better",
+            workspace_path=str(repo),
+            idempotency_key="buzz:reader:root-event",
+            session_id="buzz-session",
+        )
+        again = factory.create_work_root(
+            conn,
+            title="duplicate delivery",
+            body="must not replace the original",
+            workspace_path=str(repo),
+            idempotency_key="buzz:reader:root-event",
+        )
+        assert again["root_id"] == first["root_id"]
+        root_id = first["root_id"]
+        root = kb.get_task(conn, root_id)
+        assert root.status == "triage"
+        assert root.current_step_key == "intake"
+        assert root.workflow_template_id == kb.GUARDED_WORK_ROOT_TEMPLATE
+        assert root.session_id == "buzz-session"
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 0
+        membership = kb.factory_task_membership(conn, root_id)
+        assert membership == {
+            "root_id": root_id,
+            "state": "intake",
+            "role": "root",
+        }
+        with pytest.raises(RuntimeError, match="controller-owned: body"):
+            kb.assert_factory_task_editable(conn, root_id, fields=["body"])
+        with pytest.raises(RuntimeError, match="owns the root lifecycle"):
+            kb.complete_task(conn, root_id, result="not factory verified")
+        with pytest.raises(RuntimeError, match="owns the root lifecycle"):
+            kb.block_task(conn, root_id, reason="generic block")
+        with pytest.raises(RuntimeError, match="controller-owned: assignee"):
+            kb.assign_task(conn, root_id, "executor")
+        with pytest.raises(RuntimeError, match="cannot be archived"):
+            kb.archive_task(conn, root_id)
+        with pytest.raises(RuntimeError, match="permanent deletion is refused"):
+            kb.delete_task(conn, root_id)
+        assert kb.get_task(conn, root_id).status == "triage"
+
+        adopted = factory.start_factory_from_root(
+            conn,
+            root_id,
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            delivery_mode="local_commit",
+            plan_title="Improve the app",
+            plan_body=(
+                "**Goal**\nImprove it.\n\n"
+                "**Acceptance criteria**\n- unit gate passes"
+            ),
+        )
+        repeated = factory.start_factory_from_root(
+            conn,
+            root_id,
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            delivery_mode="local_commit",
+        )
+        assert repeated["implement_task_id"] == adopted["implement_task_id"]
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 1
+        assert kb.get_task(conn, root_id).status == "blocked"
+        assert kb.get_task(conn, root_id).current_step_key == "implementing"
+        assert adopted["plan_sha256"]
+        plan = json.loads(adopted["plan_snapshot"])
+        assert plan["root_id"] == root_id
+        assert plan["title"] == "Improve the app"
+        assert adopted["plan_sha256"] in kb.get_task(
+            conn, adopted["implement_task_id"]
+        ).body
+        routine_blocks = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='blocked'",
+            (root_id,),
+        ).fetchall()
+        assert routine_blocks == []
+    finally:
+        conn.close()
+
+
+def test_work_root_plan_and_adoption_roll_back_together(
+    factory_env, monkeypatch,
+):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_work_root(
+            conn,
+            title="rough feature idea",
+            body="original intake",
+            workspace_path=str(repo),
+            idempotency_key="feature:atomic-plan-rollback",
+        )
+
+        def fail_insert(*args, **kwargs):
+            raise RuntimeError("injected adoption failure")
+
+        monkeypatch.setattr(factory, "_insert_factory_for_root", fail_insert)
+        with pytest.raises(RuntimeError, match="injected adoption failure"):
+            factory.start_factory_from_root(
+                conn,
+                created["root_id"],
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                delivery_mode="local_commit",
+                plan_title="Approved title",
+                plan_body="Approved acceptance criteria",
+            )
+
+        root = kb.get_task(conn, created["root_id"])
+        assert root.title == "rough feature idea"
+        assert root.body == "original intake"
+        assert root.status == "triage"
+        assert root.current_step_key == "intake"
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_work_root_adoption_rejects_a_preexisting_blank_plan(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_work_root(
+            conn,
+            title="Blank plan",
+            body="",
+            workspace_path=str(repo),
+            idempotency_key="feature:blank-plan",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_step_key='planned' WHERE id=?",
+                (created["root_id"],),
+            )
+        with pytest.raises(ValueError, match="approved plan body cannot be blank"):
+            factory.start_factory_from_root(
+                conn,
+                created["root_id"],
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                delivery_mode="local_commit",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_concurrent_work_root_adoption_creates_one_phase_graph(factory_env):
+    _, repo = factory_env
+    with kb.connect_closing() as conn:
+        created = factory.create_work_root(
+            conn,
+            title="Concurrent feature",
+            body="raw request",
+            workspace_path=str(repo),
+            idempotency_key="feature:concurrent-adoption",
+        )
+    barrier = threading.Barrier(2)
+
+    def adopt():
+        thread_conn = kb.connect()
+        try:
+            barrier.wait(timeout=5)
+            return factory.start_factory_from_root(
+                thread_conn,
+                created["root_id"],
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                delivery_mode="local_commit",
+                plan_body="Approved concurrent plan",
+            )
+        finally:
+            thread_conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = [future.result() for future in (pool.submit(adopt), pool.submit(adopt))]
+
+    assert len({receipt["root_id"] for receipt in receipts}) == 1
+    assert len({receipt["implement_task_id"] for receipt in receipts}) == 1
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM factory_workflows").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+
+
+def test_active_factory_plan_and_audit_cards_are_immutable(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn,
+            title="Protected root",
+            body="Keep the plan and phase audit stable.",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            idempotency_key="feature:protected-root",
+            delivery_mode="local_commit",
+        )
+        root = created["root_id"]
+        phase = created["implement_task_id"]
+        with pytest.raises(RuntimeError, match="controller-owned: body"):
+            kb.assert_factory_task_editable(conn, root, fields=["body"])
+        with pytest.raises(RuntimeError, match="cannot be archived"):
+            kb.archive_task(conn, phase)
+        with pytest.raises(RuntimeError, match="permanent deletion is refused"):
+            kb.delete_task(conn, root)
+        with pytest.raises(RuntimeError, match="controller-owned: assignee"):
+            kb.assign_task(conn, phase, "fixer")
+        with pytest.raises(RuntimeError, match="controller-owned: model_override"):
+            kb.set_model_override(conn, phase, "test-model")
+        with pytest.raises(RuntimeError, match="controller-owned: reasoning_effort"):
+            kb.set_reasoning_effort(conn, phase, "high")
+        assert kb.get_task(conn, root).status == "blocked"
+        assert kb.get_task(conn, phase) is not None
+    finally:
+        conn.close()
+
+
+def test_legacy_factory_root_without_template_remains_inspectable(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn,
+            title="Legacy factory",
+            body="Preserve existing guarded rows.",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            idempotency_key="feature:legacy-inspection",
+            delivery_mode="local_commit",
+        )
+        root_id = created["root_id"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id=NULL WHERE id=?",
+                (root_id,),
+            )
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="legacy-thread",
+        )
+
+        assert factory.inspect_work_root(conn, root_id)["state"] == "implementing"
+        assert factory.find_work_root_for_origin(
+            conn,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="legacy-thread",
+        ) == root_id
+    finally:
+        conn.close()
+
+
 def test_factory_root_rejects_false_completion_and_requires_dual_quorum(factory_env):
     _, repo = factory_env
     conn = kb.connect()
@@ -73,7 +335,7 @@ def test_factory_root_rejects_false_completion_and_requires_dual_quorum(factory_
             delivery_mode="local_commit",
         )
         root = created["root_id"]
-        with pytest.raises(Exception, match="factory root is not verified"):
+        with pytest.raises(RuntimeError, match="owns the root lifecycle"):
             kb.complete_task(conn, root, summary="looks good")
 
         implement = created["implement_task_id"]
@@ -122,6 +384,9 @@ def test_factory_root_rejects_false_completion_and_requires_dual_quorum(factory_
         done = factory.reconcile_factory(conn, root)
         assert done["state"] == "done"
         assert kb.get_task(conn, root).status == "done"
+        final_receipt = json.loads(kb.get_task(conn, root).result)
+        assert final_receipt["plan_sha256"] == done["plan_sha256"]
+        assert kb.get_task(conn, root).current_step_key == "done"
     finally:
         conn.close()
 
@@ -198,6 +463,17 @@ def test_review_changes_routes_only_to_fixer_and_invalidates_prior_approvals(fac
         assert rereview["candidate_sha"] != candidate
         assert rereview["reviewer_a_task_id"] != review["reviewer_a_task_id"]
         assert rereview["reviewer_b_task_id"] != review["reviewer_b_task_id"]
+        historical = [
+            created["implement_task_id"],
+            review["reviewer_a_task_id"],
+            review["reviewer_b_task_id"],
+        ]
+        for task_id in historical:
+            membership = kb.factory_task_membership(conn, task_id)
+            assert membership["root_id"] == root
+            assert membership["role"] == "phase_audit"
+            with pytest.raises(RuntimeError, match="permanent deletion is refused"):
+                kb.delete_task(conn, task_id)
     finally:
         conn.close()
 

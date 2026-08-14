@@ -112,6 +112,36 @@ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
 
 
+def _thread_refs(tags: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Return canonical Nostr root/reply event ids from Buzz message tags."""
+    root = None
+    parent = None
+    unmarked: List[str] = []
+    if not isinstance(tags, list):
+        return root, parent
+    for tag in tags:
+        if not isinstance(tag, list) or len(tag) < 2 or tag[0] != "e":
+            continue
+        event_id = str(tag[1] or "").strip()
+        if not event_id:
+            continue
+        marker = str(tag[3] or "").strip().lower() if len(tag) > 3 else ""
+        if marker == "root":
+            root = event_id
+        elif marker == "reply":
+            parent = event_id
+        elif not marker:
+            unmarked.append(event_id)
+    if unmarked:
+        if root is None:
+            root = unmarked[0]
+        if parent is None:
+            parent = unmarked[-1]
+    if root is None and parent is not None:
+        root = parent
+    return root, parent
+
+
 def _load_nostr_auth():
     """Import the sibling nostr_auth module in a loader-agnostic way.
 
@@ -1048,6 +1078,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        root_event_id, _reply_parent_id = _thread_refs(event.get("tags"))
+        work_thread_id = None if is_dm else (root_event_id or event_id)
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1056,6 +1089,8 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=work_thread_id,
+            parent_chat_id=channel_id if work_thread_id else None,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1219,6 +1254,8 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1267,9 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
         )
 
         event = MessageEvent(

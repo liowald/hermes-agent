@@ -722,7 +722,13 @@ class GatewayKanbanWatchersMixin:
                                     )
                             last_passive_cursor = int(ev.id)
                             await asyncio.to_thread(
-                                self._kanban_delivery_success, sub, d["claim_token"], board_slug,
+                                self._kanban_delivery_success,
+                                sub,
+                                d["claim_token"],
+                                board_slug,
+                                getattr(_send_res, "message_id", None),
+                                kind,
+                                int(ev.id),
                             )
                         except Exception as exc:
                             fails, quarantined = await asyncio.to_thread(
@@ -771,7 +777,10 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "blocked", "factory_blocked",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -808,6 +817,8 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "factory_blocked" in _wake_kinds:
+                                _parts.append("factory needs an operator decision")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -1082,7 +1093,13 @@ class GatewayKanbanWatchersMixin:
             conn.close()
 
     def _kanban_delivery_success(
-        self, sub: dict, claim_token: str, board: Optional[str] = None,
+        self,
+        sub: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+        outbound_message_id: Optional[str] = None,
+        event_kind: Optional[str] = None,
+        event_id: Optional[int] = None,
     ) -> None:
         """Clear persisted retry evidence after one successful delivery."""
         from hermes_cli import kanban_db as _kb
@@ -1095,6 +1112,9 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 claim_token=claim_token,
+                outbound_message_id=outbound_message_id,
+                event_kind=event_kind,
+                event_id=event_id,
             )
         finally:
             conn.close()

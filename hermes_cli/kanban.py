@@ -606,7 +606,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "factory",
         help="Create, inspect, or deterministically reconcile a guarded coding factory",
     )
-    p_factory.add_argument("factory_action", choices=("create", "show", "reconcile", "retry"))
+    p_factory.add_argument(
+        "factory_action",
+        choices=("intake", "adopt", "create", "show", "reconcile", "retry"),
+    )
     p_factory.add_argument("root_id", nargs="?", default=None)
     p_factory.add_argument("--title", default=None)
     p_factory.add_argument("--body", default=None)
@@ -2333,8 +2336,34 @@ def _cmd_factory(args: argparse.Namespace) -> int:
 
     action = args.factory_action
     with kb.connect_closing() as conn:
-        if action == "create":
-            if not args.title or not args.body or not args.idempotency_key:
+        if action == "intake":
+            if not args.title or not args.idempotency_key:
+                print(
+                    "kanban factory intake requires --title and --idempotency-key",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                _ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+            except argparse.ArgumentTypeError as exc:
+                print(f"kanban factory: {exc}", file=sys.stderr)
+                return 2
+            result = factory.create_work_root(
+                conn,
+                title=args.title,
+                body=args.body or "",
+                workspace_path=ws_path,
+                project_id=args.project,
+                idempotency_key=args.idempotency_key,
+                created_by=_profile_author(),
+            )
+        elif action in {"create", "adopt"}:
+            if action == "adopt" and not args.root_id:
+                print("kanban factory adopt requires root_id", file=sys.stderr)
+                return 2
+            if action == "create" and (
+                not args.title or not args.body or not args.idempotency_key
+            ):
                 print(
                     "kanban factory create requires --title, --body, and --idempotency-key",
                     file=sys.stderr,
@@ -2348,27 +2377,34 @@ def _cmd_factory(args: argparse.Namespace) -> int:
             if ws_kind not in {"worktree", "dir"}:
                 print("kanban factory: workspace must be worktree or dir:<path>", file=sys.stderr)
                 return 2
-            result = factory.create_factory(
-                conn,
-                title=args.title,
-                body=args.body,
-                workspace_kind=ws_kind,
-                workspace_path=ws_path,
-                project_id=args.project,
-                executor=args.executor,
-                reviewer_a=args.reviewer_a,
-                reviewer_b=args.reviewer_b,
-                fixer=args.fixer,
-                idempotency_key=args.idempotency_key,
-                created_by=_profile_author(),
-                delivery_mode=args.delivery_mode,
+            common = {
+                "workspace_kind": ws_kind,
+                "workspace_path": ws_path,
+                "project_id": args.project,
+                "executor": args.executor,
+                "reviewer_a": args.reviewer_a,
+                "reviewer_b": args.reviewer_b,
+                "fixer": args.fixer,
+                "delivery_mode": args.delivery_mode,
+            }
+            result = (
+                factory.start_factory_from_root(conn, args.root_id, **common)
+                if action == "adopt"
+                else factory.create_factory(
+                    conn,
+                    title=args.title,
+                    body=args.body,
+                    idempotency_key=args.idempotency_key,
+                    created_by=_profile_author(),
+                    **common,
+                )
             )
         else:
             if not args.root_id:
                 print(f"kanban factory {action} requires root_id", file=sys.stderr)
                 return 2
             result = (
-                factory.inspect_factory(conn, args.root_id)
+                factory.inspect_work_root(conn, args.root_id)
                 if action == "show"
                 else (
                     factory.retry_factory(conn, args.root_id)
@@ -2663,14 +2699,26 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if purge_ids:
             for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
+                try:
+                    deleted = kb.delete_archived_task(conn, tid)
+                except RuntimeError as exc:
+                    failed.append(tid)
+                    print(f"cannot delete {tid}: {exc}", file=sys.stderr)
+                    continue
+                if not deleted:
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                archived = kb.archive_task(conn, tid)
+            except RuntimeError as exc:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {exc}", file=sys.stderr)
+                continue
+            if not archived:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

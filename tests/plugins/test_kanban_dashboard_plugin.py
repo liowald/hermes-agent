@@ -478,6 +478,100 @@ def test_delete_task(client):
     assert r.status_code == 404
 
 
+def test_active_factory_cards_reject_dashboard_mutation(
+    client, kanban_home, tmp_path,
+):
+    from hermes_cli import kanban_factory as factory
+
+    for name in ("executor", "reviewer-a", "reviewer-b", "fixer"):
+        profile = kanban_home / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text("model:\n  default: test\n")
+    repo = tmp_path / "factory-dashboard-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "dashboard@example.test"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Dashboard Test"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "app.txt").write_text("before\n")
+    subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    with kb.connect_closing() as conn:
+        held = factory.create_work_root(
+            conn,
+            title="Held Buzz intake",
+            body="Preserve this root before adoption.",
+            workspace_path=str(repo),
+            idempotency_key="dashboard:held-work-root",
+        )
+        created = factory.create_factory(
+            conn,
+            title="Protected factory",
+            body="Keep controller state immutable.",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            idempotency_key="dashboard:protected-factory",
+            delivery_mode="local_commit",
+        )
+
+    held_id = held["root_id"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{held_id}",
+        json={"status": "ready"},
+    ).status_code == 409
+    bulk = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [held_id], "status": "ready"},
+    )
+    assert bulk.status_code == 200
+    assert bulk.json()["results"] == [
+        {
+            "id": held_id,
+            "ok": False,
+            "error": (
+                f"factory {held_id} owns the root lifecycle; "
+                "use factory adoption, retry, or reconcile"
+            ),
+        }
+    ]
+    assert client.delete(
+        f"/api/plugins/kanban/tasks/{held_id}"
+    ).status_code == 409
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, held_id).status == "triage"
+
+    root_id = created["root_id"]
+    phase_id = created["implement_task_id"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{root_id}",
+        json={"title": "mutated"},
+    ).status_code == 409
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{phase_id}",
+        json={"status": "archived"},
+    ).status_code == 409
+    assert client.delete(
+        f"/api/plugins/kanban/tasks/{root_id}"
+    ).status_code == 409
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------
@@ -940,5 +1034,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

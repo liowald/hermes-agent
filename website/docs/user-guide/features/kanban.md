@@ -71,6 +71,28 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 
 ## Guarded coding factory
 
+For intake that starts as an idea and becomes an approved plan, keep one
+human-facing card through the whole lifecycle:
+
+```bash
+hermes kanban factory intake \
+  --title "Add the export flow" \
+  --body "Initial request and constraints" \
+  --workspace dir:/absolute/repository/path \
+  --idempotency-key feature:add-export
+
+hermes kanban specify ROOT_ID
+hermes kanban factory adopt ROOT_ID \
+  --workspace dir:/absolute/repository/path \
+  --delivery-mode local_commit
+```
+
+`intake` creates a managed Work Root in triage. Specification updates the same
+card and holds it out of dispatch. `adopt` freezes the plan, stores its SHA-256
+digest, and atomically starts the implementation phase. Repeating intake or
+adoption returns the existing root. See [Agent OS work roots](./agent-os-work-roots.md)
+for the complete human-facing receipt and recovery contract.
+
 Use the factory when a coding request must not become human-visible `done`
 after a single worker phase:
 

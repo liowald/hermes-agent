@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+GUARDED_WORK_ROOT_TEMPLATE = "guarded-work-v1"
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3402,6 +3403,8 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     worker_toolsets: Optional[Iterable[str]] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3445,6 +3448,8 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    workflow_template_id = str(workflow_template_id or "").strip() or None
+    current_step_key = str(current_step_key or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3724,8 +3729,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, worker_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3752,6 +3758,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3781,6 +3789,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3936,6 +3946,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        assert_factory_task_editable(conn, task_id, fields=("assignee",))
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3991,6 +4002,9 @@ def set_model_override(
     if not model:
         provider = None
     with write_txn(conn):
+        assert_factory_task_editable(
+            conn, task_id, fields=("model_override", "provider_override")
+        )
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -4030,6 +4044,7 @@ def set_reasoning_effort(
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
+        assert_factory_task_editable(conn, task_id, fields=("reasoning_effort",))
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -4779,6 +4794,13 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            membership = factory_task_membership(conn, task_id)
+            if (
+                membership
+                and membership["role"] == "root"
+                and membership["state"] != "done"
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5588,6 +5610,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    _factory_controller: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5658,6 +5681,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        assert_factory_root_lifecycle(
+            conn, task_id, factory_controller=_factory_controller
+        )
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6432,6 +6458,7 @@ def block_task(
         )
     recurrences = 0
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6672,6 +6699,7 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -6993,6 +7021,7 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -7073,6 +7102,7 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn, allow_nested=allow_nested):
+        assert_factory_root_lifecycle(conn, task_id)
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7368,11 +7398,17 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    hold_in_triage: bool = False,
 ) -> bool:
-    """Flesh out a triage task and promote it to ``todo``.
+    """Flesh out a triage task and normally promote it to ``todo``.
+
+    ``hold_in_triage`` is reserved for managed controller roots. It records the
+    approved plan on the same row, clears any assignee, sets the projected step
+    to ``planned``, and deliberately leaves the task in triage so the dispatcher
+    cannot claim it before atomic factory adoption.
 
     Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
+    and normally transitions ``status: triage -> todo`` in a single write txn. Returns
     False when the task is missing or not in the ``triage`` column — callers
     should surface that as "nothing to specify" rather than an error.
 
@@ -7390,12 +7426,26 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title,body,assignee,workflow_template_id FROM tasks "
+            "WHERE id=? AND status='triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        if (
+            hold_in_triage
+            and existing["workflow_template_id"] != GUARDED_WORK_ROOT_TEMPLATE
+        ):
+            raise ValueError("hold_in_triage is reserved for managed work roots")
+        if hold_in_triage:
+            effective_body = body if body is not None else existing["body"]
+            if not str(effective_body or "").strip():
+                raise ValueError("managed work-root plan body cannot be blank")
+        sets: list[str] = (
+            ["status = 'triage'", "assignee = NULL", "current_step_key = 'planned'"]
+            if hold_in_triage
+            else ["status = 'todo'"]
+        )
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -7406,7 +7456,7 @@ def specify_triage_task(
             sets.append("body = ?")
             params.append(body)
             changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
+        if not hold_in_triage and assignee is not None and assignee != (existing["assignee"] or None):
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
@@ -7432,7 +7482,11 @@ def specify_triage_task(
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    + (
+                        " and held for factory adoption."
+                        if hold_in_triage
+                        else " and promoted to todo."
+                    ),
                     int(time.time()),
                 ),
             )
@@ -7440,14 +7494,21 @@ def specify_triage_task(
             conn,
             task_id,
             "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            {
+                "changed_fields": changed_fields,
+                "held_for_factory": True,
+                "current_step_key": "planned",
+            }
+            if hold_in_triage
+            else ({"changed_fields": changed_fields} if changed_fields else None),
         )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    if not hold_in_triage:
+        recompute_ready(conn)
     return True
 
 
@@ -7684,8 +7745,108 @@ def decompose_triage_task(
     return child_ids
 
 
+def factory_task_membership(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the factory workflow/role that durably references ``task_id``."""
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_workflows'"
+    ).fetchone()
+    row = None
+    if table:
+        row = conn.execute(
+            "SELECT root_id,state,implement_task_id,reviewer_a_task_id,reviewer_b_task_id,"
+            "fixer_task_id,delivery_task_id FROM factory_workflows "
+            "WHERE root_id=? OR implement_task_id=? OR reviewer_a_task_id=? "
+            "OR reviewer_b_task_id=? OR fixer_task_id=? OR delivery_task_id=? LIMIT 1",
+            (task_id, task_id, task_id, task_id, task_id, task_id),
+        ).fetchone()
+    if row is None:
+        if table:
+            row = conn.execute(
+                "SELECT f.root_id,f.state FROM factory_workflows f "
+                "JOIN tasks t ON t.id=? AND t.created_by=f.root_id LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "root_id": row["root_id"],
+                    "state": row["state"],
+                    "role": "phase_audit",
+                }
+        held_root = conn.execute(
+            "SELECT id,current_step_key FROM tasks "
+            "WHERE id=? AND workflow_template_id=?",
+            (task_id, GUARDED_WORK_ROOT_TEMPLATE),
+        ).fetchone()
+        if held_root is None:
+            return None
+        return {
+            "root_id": held_root["id"],
+            "state": held_root["current_step_key"] or "intake",
+            "role": "root",
+        }
+    role = "root"
+    for field in (
+        "implement_task_id", "reviewer_a_task_id", "reviewer_b_task_id",
+        "fixer_task_id", "delivery_task_id",
+    ):
+        if row[field] == task_id:
+            role = field.removesuffix("_task_id")
+            break
+    return {"root_id": row["root_id"], "state": row["state"], "role": role}
+
+
+def assert_factory_root_lifecycle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    factory_controller: bool = False,
+) -> None:
+    """Keep a managed Work Root out of generic task lifecycle mutations."""
+    membership = factory_task_membership(conn, task_id)
+    if (
+        membership
+        and membership["role"] == "root"
+        and membership["state"] != "done"
+        and not factory_controller
+    ):
+        raise RuntimeError(
+            f"factory {membership['root_id']} owns the root lifecycle; "
+            "use factory adoption, retry, or reconcile"
+        )
+
+
+def assert_factory_task_editable(
+    conn: sqlite3.Connection, task_id: str, *, fields: Iterable[str],
+) -> None:
+    """Reject role, capability, and plan edits while a factory is active."""
+    membership = factory_task_membership(conn, task_id)
+    immutable = {
+        "title",
+        "body",
+        "assignee",
+        "model_override",
+        "provider_override",
+        "reasoning_effort",
+        "worker_toolsets",
+    }
+    changed = set(fields) & immutable
+    if membership and membership["state"] != "done" and changed:
+        raise RuntimeError(
+            f"factory {membership['root_id']} is active; {membership['role']} "
+            f"fields are controller-owned: {', '.join(sorted(changed))}"
+        )
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership and membership["state"] != "done":
+            raise RuntimeError(
+                f"factory {membership['root_id']} is active; its "
+                f"{membership['role']} card cannot be archived"
+            )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7718,6 +7879,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership:
+            raise RuntimeError(
+                f"factory audit {membership['root_id']} references this "
+                f"{membership['role']} card; permanent deletion is refused"
+            )
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7747,6 +7914,12 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership:
+            raise RuntimeError(
+                f"factory audit {membership['root_id']} references this "
+                f"{membership['role']} card; permanent deletion is refused"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8097,6 +8270,7 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -11773,16 +11947,33 @@ def record_notify_delivery_success(
     chat_id: str,
     thread_id: Optional[str] = None,
     claim_token: Optional[str] = None,
+    outbound_message_id: Optional[str] = None,
+    event_kind: Optional[str] = None,
+    event_id: Optional[int] = None,
 ) -> None:
-    """Clear persisted transient failure evidence after a delivered event."""
+    """Clear failures and retain an ID-only visible delivery receipt."""
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_metadata FROM kanban_notify_subs "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        metadata = _decode_notify_delivery_metadata(
+            row["delivery_metadata"] if row else None
+        )
+        if outbound_message_id:
+            metadata["last_delivery_message_id"] = str(outbound_message_id)
+            metadata["last_delivery_event_kind"] = str(event_kind or "")
+            if event_id is not None:
+                metadata["last_delivery_event_id"] = int(event_id)
         conn.execute(
             "UPDATE kanban_notify_subs SET delivery_failures=0,"
-            "delivery_last_error=NULL "
+            "delivery_last_error=NULL,delivery_metadata=? "
             "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
             "AND delivery_quarantined_at IS NULL "
             "AND (? IS NULL OR delivery_claim_token=?)",
             (
+                _encode_notify_delivery_metadata(metadata),
                 task_id, platform, chat_id, thread_id or "",
                 claim_token, claim_token,
             ),

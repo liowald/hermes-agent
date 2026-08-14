@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import threading
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,47 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert f"Task {child_id}: child task" in output
     assert f"parents:   {parent_id}" in output
     assert "Cannot operate on a closed database" not in output
+
+
+def test_factory_intake_and_adopt_cli_keep_same_root(kanban_home, tmp_path):
+    for name in ("executor", "reviewer-a", "reviewer-b", "fixer"):
+        profile = kanban_home / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text("model:\n  default: test\n")
+    repo = tmp_path / "cli-factory-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "cli@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "CLI Test"], cwd=repo, check=True)
+    (repo / "app.txt").write_text("before\n")
+    subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+    intake = json.loads(kc.run_slash(
+        "factory intake --title 'CLI root' --body 'rough plan' "
+        f"--workspace 'dir:{repo}' --idempotency-key cli-root --json"
+    ))
+    root_id = intake["root_id"]
+    shown = json.loads(kc.run_slash(f"factory show {root_id} --json"))
+    assert shown["root_id"] == root_id
+    assert shown["state"] == "intake"
+    assert shown["implement_task_id"] is None
+    with kb.connect_closing() as conn:
+        assert kb.specify_triage_task(
+            conn,
+            root_id,
+            body="**Goal**\nShip through the guarded factory.",
+            hold_in_triage=True,
+        )
+
+    adopted = json.loads(kc.run_slash(
+        f"factory adopt {root_id} --workspace 'dir:{repo}' "
+        "--delivery-mode local_commit --json"
+    ))
+
+    assert adopted["root_id"] == root_id
+    assert adopted["state"] == "implementing"
+    assert adopted["plan_sha256"]
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
@@ -177,5 +219,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-

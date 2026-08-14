@@ -975,6 +975,186 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     assert d["subscribed"] is False, d
 
 
+def test_buzz_work_root_intake_derives_thread_key_and_current_origin_lookup(
+    monkeypatch, worker_env, tmp_path,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "buzz")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "reader-channel")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "root-event")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    from pathlib import Path
+    import subprocess
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: false\n"
+    )
+    for name in ("executor", "reviewer-a", "reviewer-b", "fixer"):
+        profile = home / "profiles" / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text("model:\n  default: test\n")
+    repo = tmp_path / "buzz-root-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "work-root@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Work Root"], cwd=repo, check=True)
+    (repo / "app.txt").write_text("before\n")
+    subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_factory as factory
+
+    intake = json.loads(kt._handle_factory_create({
+        "action": "intake",
+        "title": "Reader idea",
+        "body": "capture the request",
+        "workspace_path": str(repo),
+    }))
+    assert intake["ok"] is True
+    assert intake["accepted"] is True
+    assert intake["state"] == "intake"
+    assert intake["next_gate"] == "specification"
+    root_id = intake["root_id"]
+    shown = json.loads(kt._handle_factory_show({}))
+    assert shown["ok"] is True
+    assert shown["root_id"] == root_id
+
+    conn = kb.connect()
+    try:
+        root = kb.get_task(conn, root_id)
+        assert root.idempotency_key == "hermes-factory-root:buzz:reader-channel:root-event"
+        subs = kb.list_notify_subs(conn, root_id)
+        assert len(subs) == 1
+        assert subs[0]["thread_id"] == "root-event"
+        assert subs[0]["delivery_mode"] == "notify+wake"
+        kb.record_notify_delivery_success(
+            conn,
+            task_id=root_id,
+            platform="buzz",
+            chat_id="reader-channel",
+            thread_id="root-event",
+            outbound_message_id="intake-receipt",
+            event_kind="work_root_created",
+            event_id=1,
+        )
+    finally:
+        conn.close()
+
+    adopted = json.loads(kt._handle_factory_create({
+        "action": "adopt",
+        "root_id": root_id,
+        "title": "Implement the Reader idea",
+        "body": "**Goal**\nImplement it.\n\n**Acceptance criteria**\n- local gate passes",
+        "workspace_kind": "dir",
+        "workspace_path": str(repo),
+        "delivery_mode": "local_commit",
+    }))
+    assert adopted["ok"] is True
+    assert adopted["accepted"] is True
+    assert adopted["root_id"] == root_id
+    assert adopted["implement_task_id"]
+    assert adopted["next_gate"] == "implementation receipt"
+    conn = kb.connect()
+    try:
+        plan = json.loads(factory.inspect_factory(conn, root_id)["plan_snapshot"])
+        assert plan["title"] == "Implement the Reader idea"
+        assert "local gate passes" in plan["body"]
+        sub = kb.list_notify_subs(conn, root_id)[0]
+        assert sub["delivery_metadata"]["last_delivery_message_id"] == "intake-receipt"
+    finally:
+        conn.close()
+
+    replayed = json.loads(kt._handle_factory_create({
+        "action": "intake",
+        "title": "Ignored replay title",
+        "body": "ignored replay body",
+    }))
+    assert replayed["ok"] is True
+    assert replayed["root_id"] == root_id
+    assert replayed["state"] == "implementing"
+    assert replayed["next_gate"] == "implementation receipt"
+
+    mismatched_key = json.loads(kt._handle_factory_create({
+        "action": "intake",
+        "title": "Duplicate root attempt",
+        "idempotency_key": "caller-invented-key",
+    }))
+    assert "error" in mismatched_key
+    assert "canonical channel/thread" in mismatched_key["error"]
+
+    with monkeypatch.context() as other_thread:
+        other_thread.setenv("HERMES_SESSION_THREAD_ID", "other-root-event")
+        other = json.loads(kt._handle_factory_create({
+            "action": "intake",
+            "title": "Other thread idea",
+            "body": "Keep this origin separate.",
+            "workspace_path": str(repo),
+        }))
+    assert other["ok"] is True
+    assert other["root_id"] != root_id
+
+    wrong_origin = json.loads(kt._handle_factory_create({
+        "action": "adopt",
+        "root_id": other["root_id"],
+        "body": "Do not adopt another thread's root.",
+        "workspace_kind": "dir",
+        "workspace_path": str(repo),
+        "delivery_mode": "local_commit",
+    }))
+    assert "error" in wrong_origin
+    assert "does not belong to the current Buzz thread" in wrong_origin["error"]
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM factory_workflows WHERE root_id=?",
+            (other["root_id"],),
+        ).fetchone() is None
+        other_subs = kb.list_notify_subs(conn, other["root_id"])
+        assert {sub["thread_id"] for sub in other_subs} == {"other-root-event"}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_template_id=?",
+            (kb.GUARDED_WORK_ROOT_TEMPLATE,),
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+    with monkeypatch.context() as failure_ctx:
+        failure_ctx.setenv("HERMES_SESSION_THREAD_ID", "unsubscribed-root")
+        failure_ctx.setattr(kt, "_maybe_auto_subscribe", lambda *a, **k: False)
+        failed = json.loads(kt._handle_factory_create({
+            "action": "create",
+            "title": "Must not start silently",
+            "body": "Approved plan that requires a durable Buzz receipt.",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+            "delivery_mode": "local_commit",
+        }))
+    assert "error" in failed
+    assert "remains held in intake" in failed["error"]
+    conn = kb.connect()
+    try:
+        held = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?",
+            (
+                "hermes-factory-root:"
+                "buzz:reader-channel:unsubscribed-root",
+            ),
+        ).fetchone()
+        assert held is not None
+        held_task = kb.get_task(conn, held["id"])
+        assert held_task.status == "triage"
+        assert held_task.current_step_key == "intake"
+        assert conn.execute(
+            "SELECT 1 FROM factory_workflows WHERE root_id=?",
+            (held_task.id,),
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Attachments — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------

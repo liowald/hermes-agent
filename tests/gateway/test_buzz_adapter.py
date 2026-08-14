@@ -24,6 +24,7 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_thread_refs = _buzz_mod._thread_refs
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -208,6 +209,67 @@ class TestPollingDedupe:
         await adapter._poll_channel(CHANNEL)
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_channel_reply_preserves_marked_work_root(self, adapter):
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group", "last_ts": 0, "seen": {}
+        }
+        event = _event("reply-event", content="@Chip continue this", created_at=200)
+        event["tags"] = [
+            ["h", CHANNEL],
+            ["e", "root-event", "", "root"],
+            ["e", "parent-event", "", "reply"],
+        ]
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+        assert len(adapter._dispatched) == 1
+        dispatched = adapter._dispatched[0]
+        assert dispatched["thread_id"] == "root-event"
+        assert dispatched["parent_chat_id"] == CHANNEL
+        assert dispatched["message_id"] == "reply-event"
+
+
+def test_thread_refs_support_marked_and_legacy_reply_tags():
+    assert _thread_refs([
+        ["e", "root", "", "root"],
+        ["e", "parent", "", "reply"],
+    ]) == ("root", "parent")
+    assert _thread_refs([["e", "legacy-parent"]]) == (
+        "legacy-parent", "legacy-parent"
+    )
+    assert _thread_refs([
+        ["e", "legacy-root"],
+        ["e", "legacy-parent"],
+    ]) == ("legacy-root", "legacy-parent")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_builds_thread_aware_session_source():
+    adapter = _make_adapter()
+    captured = []
+    adapter._message_handler = AsyncMock()
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    await adapter._dispatch_message(
+        text="continue",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Reader",
+        message_id="reply-event",
+        created_at=100,
+        thread_id="root-event",
+        parent_chat_id=CHANNEL,
+    )
+
+    assert captured[0].source.thread_id == "root-event"
+    assert captured[0].source.parent_chat_id == CHANNEL
+    assert captured[0].source.message_id == "reply-event"
+
 
 # ── Mention gating / DMs / authorization ──────────────────────────────────
 
@@ -321,6 +383,7 @@ class TestDmClassification:
         assert adapter._channel_state[DM_CHANNEL]["chat_type"] == "dm"
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
         assert adapter._dispatched[0]["chat_type"] == "dm"
+        assert adapter._dispatched[0]["thread_id"] is None
 
 
     @pytest.mark.asyncio
@@ -536,5 +599,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-

@@ -81,6 +81,37 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
         conn.close()
 
 
+def test_successful_buzz_delivery_persists_id_only_receipt(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="receipt task")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="root-event",
+            delivery_metadata={"thread_id": "root-event"},
+        )
+        kb.record_notify_delivery_success(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="root-event",
+            outbound_message_id="visible-event",
+            event_kind="completed",
+            event_id=42,
+        )
+        metadata = kb.list_notify_subs(conn, tid)[0]["delivery_metadata"]
+        assert metadata["thread_id"] == "root-event"
+        assert metadata["last_delivery_message_id"] == "visible-event"
+        assert metadata["last_delivery_event_kind"] == "completed"
+        assert metadata["last_delivery_event_id"] == 42
+    finally:
+        conn.close()
+
+
 def test_child_task_inherits_parent_delivery_mode(kanban_home):
     """Graph children inherit the parent's ACK edge AND its delivery_mode."""
     import hermes_cli.kanban_db as kb
@@ -380,7 +411,12 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             delivery_mode="notify+wake",
         )
         kb.block_task(conn, passive_tid, reason="passive block")
-        kb.block_task(conn, active_tid, reason="active block")
+        kb._append_event(
+            conn,
+            active_tid,
+            kind="factory_blocked",
+            payload={"reason": "review evidence needs an operator"},
+        )
     finally:
         conn.close()
 
@@ -419,10 +455,11 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     # Both subs still get a passive send (notify AND notify+wake send).
     assert len(sent_msgs) == 2
     assert any("passive block" in m for m in sent_msgs)
-    assert any("active block" in m for m in sent_msgs)
+    assert any("Factory" in m and "operator action required" in m for m in sent_msgs)
     # Only the notify+wake sub woke the agent, exactly once.
     wake_mock.assert_awaited_once()
     assert active_tid in wake_mock.await_args.kwargs["text"]
+    assert "factory needs an operator decision" in wake_mock.await_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ reconciler has validated every phase receipt.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -20,7 +21,9 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.profiles import profile_exists, validate_profile_name
 
 
-FACTORY_VERSION = 1
+FACTORY_VERSION = 2
+WORK_ROOT_TEMPLATE = kb.GUARDED_WORK_ROOT_TEMPLATE
+_WORK_ROOT_KEY_PREFIX = "hermes-factory-root:"
 _TERMINAL = {"done", "archived"}
 _OPEN = {"ready", "running", "todo", "blocked", "review", "scheduled", "triage"}
 
@@ -55,6 +58,8 @@ def ensure_schema(conn) -> None:
             delivery_task_id    TEXT,
             candidate_sha       TEXT,
             review_bundle_path  TEXT,
+            plan_snapshot       TEXT,
+            plan_sha256         TEXT,
             final_receipt       TEXT,
             last_error          TEXT,
             blocked_from_state  TEXT,
@@ -75,6 +80,18 @@ def ensure_schema(conn) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'factory root is not verified');
         END;
+        CREATE TRIGGER IF NOT EXISTS factory_root_status_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN NEW.status != OLD.status
+          AND EXISTS (
+              SELECT 1 FROM factory_workflows f
+               WHERE f.root_id = NEW.id
+                 AND f.state != 'done'
+                 AND NOT (f.state = 'completing' AND NEW.status = 'done')
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'factory root is not verified; status is controller-owned');
+        END;
         """
     )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(factory_workflows)")}
@@ -82,6 +99,10 @@ def ensure_schema(conn) -> None:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN request_key TEXT")
     if "final_receipt" not in columns:
         conn.execute("ALTER TABLE factory_workflows ADD COLUMN final_receipt TEXT")
+    if "plan_snapshot" not in columns:
+        conn.execute("ALTER TABLE factory_workflows ADD COLUMN plan_snapshot TEXT")
+    if "plan_sha256" not in columns:
+        conn.execute("ALTER TABLE factory_workflows ADD COLUMN plan_sha256 TEXT")
     if "delivery_mode" not in columns:
         conn.execute(
             "ALTER TABLE factory_workflows ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'draft_pr'"
@@ -101,6 +122,12 @@ def ensure_schema(conn) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_factory_request_key "
         "ON factory_workflows(request_key) WHERE request_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_guarded_work_root_key "
+        "ON tasks(idempotency_key) "
+        f"WHERE workflow_template_id='{WORK_ROOT_TEMPLATE}' "
+        "AND idempotency_key IS NOT NULL"
     )
 
 
@@ -186,6 +213,451 @@ def _factory_source_repo(
     return None
 
 
+def _root_key(request_key: str) -> str:
+    return f"{_WORK_ROOT_KEY_PREFIX}{request_key}"
+
+
+def _request_key_from_root(task: kb.Task) -> str:
+    value = str(task.idempotency_key or "")
+    if not value.startswith(_WORK_ROOT_KEY_PREFIX):
+        raise ValueError("managed work root has no factory request key")
+    request_key = value[len(_WORK_ROOT_KEY_PREFIX):].strip()
+    if not request_key:
+        raise ValueError("managed work root has an empty factory request key")
+    return request_key
+
+
+def _plan_contract(task: kb.Task) -> tuple[str, str]:
+    payload = {
+        "contract": "hermes.work-root.plan.v1",
+        "root_id": task.id,
+        "title": task.title,
+        "body": task.body or "",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stage(conn, root_id: str, value: str) -> None:
+    conn.execute(
+        "UPDATE tasks SET current_step_key=? WHERE id=?",
+        (value, root_id),
+    )
+
+
+def _plan_root_for_adoption(
+    conn,
+    root: kb.Task,
+    *,
+    title: Optional[str],
+    body: Optional[str],
+) -> kb.Task:
+    """Persist an approved plan without exposing a dispatchable state."""
+    if body is None:
+        return root
+    planned_body = str(body).strip()
+    if not planned_body:
+        raise ValueError("approved plan body cannot be blank")
+    planned_title = str(title).strip() if title is not None else root.title
+    if not planned_title:
+        raise ValueError("approved plan title cannot be blank")
+    if root.status != "triage" or root.current_step_key not in {"intake", "planned"}:
+        raise ValueError("only an intake or planned Work Root can accept a plan")
+    changed_fields = [
+        field
+        for field, before, after in (
+            ("title", root.title, planned_title),
+            ("body", root.body or "", planned_body),
+        )
+        if before != after
+    ]
+    conn.execute(
+        "UPDATE tasks SET title=?,body=?,assignee=NULL,current_step_key='planned' "
+        "WHERE id=? AND status='triage'",
+        (planned_title, planned_body, root.id),
+    )
+    kb._append_event(
+        conn,
+        root.id,
+        "specified",
+        {
+            "changed_fields": changed_fields,
+            "held_for_factory": True,
+            "current_step_key": "planned",
+        },
+    )
+    planned = kb.get_task(conn, root.id)
+    if planned is None:
+        raise RuntimeError("planned Work Root did not persist")
+    return planned
+
+
+def inspect_work_root(conn, root_id: str) -> dict[str, Any]:
+    """Return one truthful receipt before or after guarded factory adoption."""
+    ensure_schema(conn)
+    task = kb.get_task(conn, root_id)
+    if task is None:
+        raise ValueError(f"work root {root_id!r} not found")
+    workflow = conn.execute(
+        "SELECT 1 FROM factory_workflows WHERE root_id=?", (root_id,)
+    ).fetchone()
+    if workflow:
+        return inspect_factory(conn, root_id)
+    if task.workflow_template_id != WORK_ROOT_TEMPLATE:
+        raise ValueError(f"managed work root {root_id!r} not found")
+    return {
+        "root_id": root_id,
+        "state": task.current_step_key or "intake",
+        "contract_version": FACTORY_VERSION,
+        "workflow_template_id": task.workflow_template_id,
+        "root_status": task.status,
+        "implement_task_id": None,
+        "candidate_sha": None,
+        "plan_sha256": None,
+    }
+
+
+def find_work_root_for_origin(
+    conn,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the newest managed root subscribed to one exact origin."""
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT t.id FROM kanban_notify_subs s JOIN tasks t ON t.id=s.task_id "
+        "LEFT JOIN factory_workflows f ON f.root_id=t.id "
+        "WHERE lower(s.platform)=lower(?) AND s.chat_id=? AND s.thread_id=? "
+        "AND (t.workflow_template_id=? OR f.root_id IS NOT NULL) "
+        "ORDER BY s.created_at DESC,t.created_at DESC LIMIT 1",
+        (platform, chat_id, thread_id or "", WORK_ROOT_TEMPLATE),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
+def work_root_matches_request_key(
+    conn, root_id: str, request_key: str,
+) -> bool:
+    """Return whether a held Work Root is owned by one canonical request key."""
+    row = conn.execute(
+        "SELECT idempotency_key,workflow_template_id FROM tasks WHERE id=?",
+        (root_id,),
+    ).fetchone()
+    return bool(
+        row
+        and row["workflow_template_id"] == WORK_ROOT_TEMPLATE
+        and row["idempotency_key"] == _root_key(request_key)
+    )
+
+
+def create_work_root(
+    conn,
+    *,
+    title: str,
+    body: str = "",
+    workspace_path: Optional[str] = None,
+    project_id: Optional[str] = None,
+    priority: int = 0,
+    tenant: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    created_by: str = "factory-controller",
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create an idempotent, non-dispatchable Work Root in intake."""
+    ensure_schema(conn)
+    request_key = str(idempotency_key or "").strip()
+    if not request_key:
+        raise ValueError("idempotency_key is required for work-root intake")
+    if not str(title or "").strip():
+        raise ValueError("title is required for work-root intake")
+    root_key = _root_key(request_key)
+    existing = conn.execute(
+        "SELECT id,workflow_template_id FROM tasks WHERE idempotency_key=?",
+        (root_key,),
+    ).fetchone()
+    if existing:
+        if existing["workflow_template_id"] != WORK_ROOT_TEMPLATE:
+            raise ValueError(
+                "reserved work-root idempotency key belongs to an unmanaged task"
+            )
+        return inspect_work_root(conn, existing["id"])
+
+    try:
+        with kb.write_txn(conn):
+            existing = conn.execute(
+                "SELECT id,workflow_template_id FROM tasks WHERE idempotency_key=?",
+                (root_key,),
+            ).fetchone()
+            if existing:
+                if existing["workflow_template_id"] != WORK_ROOT_TEMPLATE:
+                    raise ValueError(
+                        "reserved work-root idempotency key belongs to an unmanaged task"
+                    )
+                raise _ExistingFactory(existing["id"])
+            root_id = kb.create_task(
+                conn,
+                title=title,
+                body=body,
+                assignee=None,
+                priority=priority,
+                tenant=tenant,
+                idempotency_key=root_key,
+                created_by=created_by,
+                triage=True,
+                workspace_kind="dir",
+                workspace_path=workspace_path,
+                project_id=project_id,
+                session_id=session_id,
+                workflow_template_id=WORK_ROOT_TEMPLATE,
+                current_step_key="intake",
+            )
+            kb._append_event(
+                conn,
+                root_id,
+                "work_root_created",
+                {
+                    "contract_version": FACTORY_VERSION,
+                    "workflow_template_id": WORK_ROOT_TEMPLATE,
+                },
+            )
+    except _ExistingFactory as existing_root:
+        return inspect_work_root(conn, existing_root.root_id)
+    return inspect_work_root(conn, root_id)
+
+
+def _factory_preflight(
+    *,
+    workspace_path: Optional[str],
+    project_id: Optional[str],
+    executor: str,
+    reviewer_a: str,
+    reviewer_b: str,
+    fixer: str,
+    delivery_mode: str,
+) -> dict[str, Any]:
+    executor = _profile(executor, "executor")
+    reviewer_a = _profile(reviewer_a, "reviewer-a")
+    reviewer_b = _profile(reviewer_b, "reviewer-b")
+    fixer = _profile(fixer, "fixer")
+    if len({executor, reviewer_a, reviewer_b, fixer}) != 4:
+        raise ValueError("executor, reviewer-a, reviewer-b, and fixer must be distinct profiles")
+    mode = str(delivery_mode or "").strip().lower()
+    if mode not in {"draft_pr", "local_commit"}:
+        raise ValueError("delivery_mode must be draft_pr or local_commit")
+    source_repo = _factory_source_repo(workspace_path, project_id)
+    if source_repo is None:
+        raise ValueError(f"{mode} factories require a repository workspace or project")
+    delivery_repo = None
+    delivery_base = None
+    if mode == "draft_pr":
+        delivery_repo, delivery_base, delivery_base_sha = _workspace_delivery_target(source_repo)
+    else:
+        delivery_base_sha = _workspace_head_sha(source_repo)
+    _require_clean_intake_base(source_repo, delivery_base_sha)
+    return {
+        "executor": executor,
+        "reviewer_a": reviewer_a,
+        "reviewer_b": reviewer_b,
+        "fixer": fixer,
+        "delivery_mode": mode,
+        "delivery_repo": delivery_repo,
+        "delivery_base": delivery_base,
+        "delivery_base_sha": delivery_base_sha,
+    }
+
+
+def _insert_factory_for_root(
+    conn,
+    *,
+    root: kb.Task,
+    request_key: str,
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    project_id: Optional[str],
+    settings: dict[str, Any],
+    priority: int,
+    tenant: Optional[str],
+) -> str:
+    """Insert the implementation phase and workflow inside an outer txn."""
+    if root.workflow_template_id != WORK_ROOT_TEMPLATE:
+        raise ValueError("factory adoption requires a managed work root")
+    if root.status != "triage" or root.current_step_key != "planned":
+        raise ValueError("work root must be specified and held in planned triage")
+    if not str(root.body or "").strip():
+        raise ValueError("work root approved plan body cannot be blank")
+    if root.current_run_id or root.claim_lock:
+        raise ValueError("work root has an active run or claim")
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? OR child_id=? LIMIT 1",
+        (root.id, root.id),
+    ).fetchone()
+    if linked:
+        raise ValueError("work root cannot be adopted after generic task linking")
+    existing_workflow = conn.execute(
+        "SELECT implement_task_id FROM factory_workflows WHERE root_id=?",
+        (root.id,),
+    ).fetchone()
+    if existing_workflow:
+        return str(existing_workflow["implement_task_id"])
+
+    phase_key = f"hermes-factory-phase:{request_key}:implement"
+    collision = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key=? LIMIT 1", (phase_key,)
+    ).fetchone()
+    if collision:
+        raise ValueError(
+            "reserved factory phase key belongs to an unrelated task; "
+            f"refusing to attach workflow to {collision['id']}"
+        )
+    plan_snapshot, plan_sha256 = _plan_contract(root)
+    implement_body = (
+        f"Factory root: {root.id}\nApproved plan SHA-256: {plan_sha256}\n"
+        f"Approved plan snapshot: {plan_snapshot}\n\n"
+        "Implement the approved plan in the isolated workspace. Do not review "
+        "your own work. Run the relevant local gates. Do not call request-review: "
+        "the factory creates separate reviewer cards. Call complete with metadata "
+        "containing non-empty changed_files and tests_run, inspection_only=false, "
+        "and delivery evidence if already available."
+    )
+    implement_id = kb.create_task(
+        conn,
+        title=f"Implement: {root.title}",
+        body=implement_body,
+        assignee=settings["executor"],
+        priority=priority,
+        tenant=tenant,
+        created_by=root.id,
+        initial_status="running",
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        project_id=project_id,
+        idempotency_key=phase_key,
+        goal_mode=False,
+    )
+    implement_task = kb.get_task(conn, implement_id)
+    if implement_task and implement_task.project_id:
+        conn.execute(
+            "UPDATE tasks SET project_id=? WHERE id=?",
+            (implement_task.project_id, root.id),
+        )
+    now = int(time.time())
+    conn.execute(
+        "UPDATE tasks SET status='blocked',assignee=NULL,current_step_key='implementing' "
+        "WHERE id=? AND status='triage'",
+        (root.id,),
+    )
+    conn.execute(
+        "INSERT INTO factory_workflows "
+        "(root_id,request_key,contract_version,state,cycle,executor_profile,reviewer_a_profile,"
+        "reviewer_b_profile,fixer_profile,delivery_mode,delivery_repo,delivery_base,delivery_base_sha,"
+        "implement_task_id,plan_snapshot,plan_sha256,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            root.id, request_key, FACTORY_VERSION, "implementing", 0,
+            settings["executor"], settings["reviewer_a"], settings["reviewer_b"],
+            settings["fixer"], settings["delivery_mode"], settings["delivery_repo"],
+            settings["delivery_base"], settings["delivery_base_sha"], implement_id,
+            plan_snapshot, plan_sha256, now, now,
+        ),
+    )
+    kb._append_event(
+        conn,
+        root.id,
+        "factory_created",
+        {
+            "contract_version": FACTORY_VERSION,
+            "implement_task_id": implement_id,
+            "plan_sha256": plan_sha256,
+            "roles": {
+                "executor": settings["executor"],
+                "reviewer_a": settings["reviewer_a"],
+                "reviewer_b": settings["reviewer_b"],
+                "fixer": settings["fixer"],
+            },
+        },
+    )
+    return implement_id
+
+
+def start_factory_from_root(
+    conn,
+    root_id: str,
+    *,
+    workspace_kind: str = "worktree",
+    workspace_path: Optional[str] = None,
+    project_id: Optional[str] = None,
+    executor: str = "executor",
+    reviewer_a: str = "reviewer-a",
+    reviewer_b: str = "reviewer-b",
+    fixer: str = "fixer",
+    priority: Optional[int] = None,
+    tenant: Optional[str] = None,
+    delivery_mode: str = "draft_pr",
+    plan_title: Optional[str] = None,
+    plan_body: Optional[str] = None,
+) -> dict[str, Any]:
+    """Atomically plan, when supplied, and adopt the same guarded Work Root."""
+    ensure_schema(conn)
+    existing = conn.execute(
+        "SELECT 1 FROM factory_workflows WHERE root_id=?", (root_id,)
+    ).fetchone()
+    if existing:
+        return inspect_factory(conn, root_id)
+    root = kb.get_task(conn, root_id)
+    if root is None or root.workflow_template_id != WORK_ROOT_TEMPLATE:
+        raise ValueError(f"managed work root {root_id!r} not found")
+    request_key = _request_key_from_root(root)
+    effective_workspace = workspace_path or root.workspace_path
+    effective_project = project_id or root.project_id
+    settings = _factory_preflight(
+        workspace_path=effective_workspace,
+        project_id=effective_project,
+        executor=executor,
+        reviewer_a=reviewer_a,
+        reviewer_b=reviewer_b,
+        fixer=fixer,
+        delivery_mode=delivery_mode,
+    )
+    with kb.write_txn(conn):
+        adopted = conn.execute(
+            "SELECT 1 FROM factory_workflows WHERE root_id=?", (root_id,)
+        ).fetchone()
+        if not adopted:
+            owner = conn.execute(
+                "SELECT root_id FROM factory_workflows WHERE request_key=?",
+                (request_key,),
+            ).fetchone()
+            if owner:
+                raise ValueError(
+                    f"factory request key already belongs to root {owner['root_id']}"
+                )
+            current = kb.get_task(conn, root_id)
+            if current is None:
+                raise ValueError(f"managed work root {root_id!r} not found")
+            current = _plan_root_for_adoption(
+                conn,
+                current,
+                title=plan_title,
+                body=plan_body,
+            )
+            _insert_factory_for_root(
+                conn,
+                root=current,
+                request_key=request_key,
+                workspace_kind=workspace_kind,
+                workspace_path=effective_workspace,
+                project_id=effective_project,
+                settings=settings,
+                priority=current.priority if priority is None else int(priority),
+                tenant=current.tenant if tenant is None else tenant,
+            )
+    return inspect_factory(conn, root_id)
+
+
 def create_factory(
     conn,
     *,
@@ -204,43 +676,35 @@ def create_factory(
     created_by: str = "factory-controller",
     delivery_mode: str = "draft_pr",
 ) -> dict[str, Any]:
-    """Create a guarded root and its first implementation phase."""
+    """Create a planned Work Root and atomically start its guarded factory.
+
+    This preserves the original one-call contract. New intake-first callers
+    use :func:`create_work_root` followed by :func:`start_factory_from_root`.
+    """
     ensure_schema(conn)
     request_key = str(idempotency_key or "").strip()
     if not request_key:
         raise ValueError("idempotency_key is required for factory creation")
-    delivery_mode = str(delivery_mode or "").strip().lower()
-    if delivery_mode not in {"draft_pr", "local_commit"}:
-        raise ValueError("delivery_mode must be draft_pr or local_commit")
     existing = conn.execute(
         "SELECT root_id FROM factory_workflows WHERE request_key=?", (request_key,)
     ).fetchone()
     if existing:
         return inspect_factory(conn, existing["root_id"])
-
-    executor = _profile(executor, "executor")
-    reviewer_a = _profile(reviewer_a, "reviewer-a")
-    reviewer_b = _profile(reviewer_b, "reviewer-b")
-    fixer = _profile(fixer, "fixer")
-    if len({executor, reviewer_a, reviewer_b, fixer}) != 4:
-        raise ValueError("executor, reviewer-a, reviewer-b, and fixer must be distinct profiles")
-    delivery_repo = None
-    delivery_base = None
-    delivery_base_sha = None
-    source_repo = _factory_source_repo(workspace_path, project_id)
-    if source_repo is None:
-        raise ValueError(
-            f"{delivery_mode} factories require a repository workspace or project"
-        )
-    if delivery_mode == "draft_pr":
-        delivery_repo, delivery_base, delivery_base_sha = _workspace_delivery_target(source_repo)
-    else:
-        delivery_base_sha = _workspace_head_sha(source_repo)
-    _require_clean_intake_base(source_repo, delivery_base_sha)
-    root_key = f"hermes-factory-root:{request_key}"
+    if workspace_kind not in {"worktree", "dir"}:
+        raise ValueError("workspace_kind must be worktree or dir")
+    settings = _factory_preflight(
+        workspace_path=workspace_path,
+        project_id=project_id,
+        executor=executor,
+        reviewer_a=reviewer_a,
+        reviewer_b=reviewer_b,
+        fixer=fixer,
+        delivery_mode=delivery_mode,
+    )
+    root_key = _root_key(request_key)
     phase_key = f"hermes-factory-phase:{request_key}:implement"
     collision = conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key IN (?,?) LIMIT 1",
+        "SELECT id,workflow_template_id FROM tasks WHERE idempotency_key IN (?,?) LIMIT 1",
         (root_key, phase_key),
     ).fetchone()
     if collision:
@@ -248,8 +712,6 @@ def create_factory(
             "reserved factory idempotency key already belongs to an unguarded task; "
             f"refusing to attach workflow to {collision['id']}"
         )
-
-    now = int(time.time())
     try:
         with kb.write_txn(conn):
             existing = conn.execute(
@@ -276,75 +738,26 @@ def create_factory(
                 tenant=tenant,
                 idempotency_key=root_key,
                 created_by=created_by,
-                initial_status="blocked",
-                workspace_kind="dir" if workspace_path else "scratch",
+                triage=True,
+                workspace_kind="dir",
                 workspace_path=workspace_path,
-                # The controller root is a lifecycle receipt, not a worker.
-                # Link its project below without allocating a root worktree.
                 project_id=None,
+                workflow_template_id=WORK_ROOT_TEMPLATE,
+                current_step_key="planned",
             )
-            implement_body = (
-                f"Factory root: {root_id}\n\n{body}\n\n"
-                "Implement the requested change in the isolated workspace. Do not review "
-                "your own work. Before completing this phase, run the relevant local gates. "
-                "Do not call request-review: the factory creates separate reviewer cards. "
-                "Call complete with metadata containing non-empty changed_files and tests_run, "
-                "inspection_only=false, and delivery evidence if already available."
-            )
-            implement_id = kb.create_task(
+            root = kb.get_task(conn, root_id)
+            if root is None:
+                raise RuntimeError("factory root creation did not persist")
+            _insert_factory_for_root(
                 conn,
-                title=f"Implement: {title}",
-                body=implement_body,
-                assignee=executor,
-                priority=priority,
-                tenant=tenant,
-                created_by=root_id,
-                initial_status="running",
+                root=root,
+                request_key=request_key,
                 workspace_kind=workspace_kind,
                 workspace_path=workspace_path,
                 project_id=project_id,
-                idempotency_key=phase_key,
-                goal_mode=False,
-            )
-            implement_task = kb.get_task(conn, implement_id)
-            if implement_task and implement_task.project_id:
-                conn.execute(
-                    "UPDATE tasks SET project_id=? WHERE id=?",
-                    (implement_task.project_id, root_id),
-                )
-            conn.execute(
-                "INSERT INTO factory_workflows "
-                "(root_id,request_key,contract_version,state,cycle,executor_profile,reviewer_a_profile,"
-                "reviewer_b_profile,fixer_profile,delivery_mode,delivery_repo,delivery_base,delivery_base_sha,"
-                "implement_task_id,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    root_id, request_key, FACTORY_VERSION, "implementing", 0, executor,
-                    reviewer_a, reviewer_b, fixer, delivery_mode, delivery_repo,
-                    delivery_base, delivery_base_sha, implement_id, now, now,
-                ),
-            )
-            kb._append_event(
-                conn,
-                root_id,
-                "factory_created",
-                {
-                    "contract_version": FACTORY_VERSION,
-                    "implement_task_id": implement_id,
-                    "roles": {
-                        "executor": executor,
-                        "reviewer_a": reviewer_a,
-                        "reviewer_b": reviewer_b,
-                        "fixer": fixer,
-                    },
-                },
-            )
-            # Keep the controller-owned root out of dispatcher promotion. A
-            # plain initial blocked row is treated as recoverable by
-            # recompute_ready; the event makes this an explicit sticky gate.
-            kb._append_event(
-                conn, root_id, "blocked",
-                {"reason": "factory lifecycle gate", "kind": "dependency"},
+                settings=settings,
+                priority=priority,
+                tenant=tenant,
             )
     except _ExistingFactory as existing_factory:
         return inspect_factory(conn, existing_factory.root_id)
@@ -424,7 +837,12 @@ def _workspace_tree_sha(path: Path) -> str:
 
 
 def _candidate_bundle(
-    workspace: str, root_id: str, cycle: int, base_sha: Optional[str] = None,
+    workspace: str,
+    root_id: str,
+    cycle: int,
+    base_sha: Optional[str] = None,
+    plan_snapshot: Optional[str] = None,
+    plan_sha256: Optional[str] = None,
 ) -> tuple[str, str, list[str]]:
     path = Path(workspace).expanduser().resolve()
     if not path.is_dir():
@@ -460,6 +878,8 @@ def _candidate_bundle(
         "workspace": str(path),
         "head": head,
         "base_sha": base_sha,
+        "plan_snapshot": plan_snapshot,
+        "plan_sha256": plan_sha256,
         "status": status.splitlines(),
         "diff": diff,
         "staged_diff": staged,
@@ -485,9 +905,11 @@ def _create_review_task(conn, row, *, profile: str, label: str, candidate: str, 
     root = kb.get_task(conn, row["root_id"])
     implement = kb.get_task(conn, row["implement_task_id"])
     body = (
-        f"Factory root: {row['root_id']}\nCandidate Git tree: {candidate}\n"
+        f"Factory root: {row['root_id']}\nApproved plan SHA-256: {row['plan_sha256'] or 'legacy-unbound'}\n"
+        f"Approved plan snapshot: {row['plan_snapshot'] or '(legacy root body)'}\n"
+        f"Candidate Git tree: {candidate}\n"
         f"Review bundle: {bundle}\nWorkspace: {implement.workspace_path if implement else ''}\n\n"
-        "Independently review the exact bundled candidate against the root acceptance "
+        "Independently review the exact bundled candidate against the frozen plan "
         "criteria. You are report-only: do not modify repository files. Complete with "
         "metadata {verdict: approve|changes, candidate_sha: <exact>, findings: [...], "
         "verification: [...]}."
@@ -518,6 +940,7 @@ def _set_error(conn, root_id: str, message: str) -> dict[str, Any]:
             (message[:2000], now, root_id),
         )
         if cur.rowcount:
+            _stage(conn, root_id, "blocked")
             kb._append_event(conn, root_id, "factory_blocked", {"reason": message[:2000]})
     return inspect_factory(conn, root_id)
 
@@ -671,6 +1094,7 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
             f"UPDATE factory_workflows SET {','.join(assignments)} WHERE root_id=?",
             values,
         )
+        _stage(conn, root_id, prior)
         kb._append_event(conn, root_id, "factory_retried", {
             "state": prior,
             "attempt": attempt,
@@ -692,7 +1116,7 @@ def _promote_reviews(conn, row, receipt: dict) -> dict[str, Any]:
     try:
         candidate, bundle, observed = _candidate_bundle(
             implement.workspace_path, row["root_id"], int(row["cycle"]),
-            row["delivery_base_sha"],
+            row["delivery_base_sha"], row["plan_snapshot"], row["plan_sha256"],
         )
     except Exception as exc:
         return _set_error(conn, row["root_id"], f"candidate capture failed: {exc}")
@@ -742,6 +1166,7 @@ def _promote_reviews(conn, row, receipt: dict) -> dict[str, Any]:
             "last_error=NULL,updated_at=? WHERE root_id=?",
             (candidate, bundle, a, b, now, row["root_id"]),
         )
+        _stage(conn, row["root_id"], "reviewing")
         kb._append_event(
             conn, row["root_id"], "factory_review_started",
             {"cycle": row["cycle"], "candidate_sha": candidate,
@@ -780,7 +1205,8 @@ def _create_fixer(conn, row, findings: list) -> str:
         conn,
         title=f"Fix review findings: {root.title if root else row['root_id']}",
         body=(
-            f"Factory root: {row['root_id']}\nRejected candidate: {row['candidate_sha']}\n\n"
+            f"Factory root: {row['root_id']}\nApproved plan SHA-256: {row['plan_sha256'] or 'legacy-unbound'}\n"
+            f"Rejected candidate: {row['candidate_sha']}\n\n"
             f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
             "You are the only writer after review. Address every finding, run local "
             "gates, and do not call request-review: the factory creates new reviewer "
@@ -806,7 +1232,8 @@ def _create_delivery(conn, row) -> str:
         conn,
         title=f"Finalize delivery: {root.title if root else row['root_id']}",
         body=(
-        f"Factory root: {row['root_id']}\nApproved candidate: {row['candidate_sha']}\n"
+        f"Factory root: {row['root_id']}\nApproved plan SHA-256: {row['plan_sha256'] or 'legacy-unbound'}\n"
+        f"Approved candidate: {row['candidate_sha']}\n"
         f"Authorized delivery mode: {row['delivery_mode']}\n\n"
             "Do not change the approved implementation. Run the final local gate and "
             "prepare the task's authorized delivery (for example a draft PR when the "
@@ -905,7 +1332,7 @@ def _finish_root(conn, row) -> dict[str, Any]:
     else:
         if not kb.complete_task(
             conn, row["root_id"], result=raw, summary="Factory delivery verified",
-            metadata=receipt, fire_lifecycle_hook=True,
+            metadata=receipt, fire_lifecycle_hook=True, _factory_controller=True,
         ):
             # Another reconciler may have won the root CAS between our read
             # and complete_task(). Treat an exact factory receipt as the same
@@ -919,6 +1346,7 @@ def _finish_root(conn, row) -> dict[str, Any]:
             "UPDATE factory_workflows SET state='done',updated_at=? WHERE root_id=?",
             (int(time.time()), row["root_id"]),
         )
+        _stage(conn, row["root_id"], "done")
     return inspect_factory(conn, row["root_id"])
 
 
@@ -947,6 +1375,7 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
         if receipt is None:
             return inspect_factory(conn, root_id)
         now = int(time.time())
+        lost_race = False
         with kb.write_txn(conn):
             current = conn.execute(
                 "SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)
@@ -956,14 +1385,18 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
                 or current["fixer_task_id"] != row["fixer_task_id"]
                 or int(current["cycle"]) != int(row["cycle"])
             ):
-                return inspect_factory(conn, root_id)
-            conn.execute(
-                "UPDATE factory_workflows SET state='implementing',cycle=cycle+1,"
-                "implement_task_id=fixer_task_id,reviewer_a_task_id=NULL,"
-                "reviewer_b_task_id=NULL,fixer_task_id=NULL,candidate_sha=NULL,"
-                "review_bundle_path=NULL,updated_at=? WHERE root_id=?",
-                (now, root_id),
-            )
+                lost_race = True
+            else:
+                conn.execute(
+                    "UPDATE factory_workflows SET state='implementing',cycle=cycle+1,"
+                    "implement_task_id=fixer_task_id,reviewer_a_task_id=NULL,"
+                    "reviewer_b_task_id=NULL,fixer_task_id=NULL,candidate_sha=NULL,"
+                    "review_bundle_path=NULL,updated_at=? WHERE root_id=?",
+                    (now, root_id),
+                )
+                _stage(conn, root_id, "implementing")
+        if lost_race:
+            return inspect_factory(conn, root_id)
         promoted = conn.execute(
             "SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)
         ).fetchone()
@@ -1001,6 +1434,7 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
                     "UPDATE factory_workflows SET state='fixing',fixer_task_id=?,updated_at=? WHERE root_id=?",
                     (fix, now, root_id),
                 )
+                _stage(conn, root_id, "fixing")
                 kb._append_event(conn, root_id, "factory_changes_requested", {
                     "candidate_sha": row["candidate_sha"], "fixer_task_id": fix,
                     "findings": findings,
@@ -1023,6 +1457,7 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
                 "UPDATE factory_workflows SET state='delivering',delivery_task_id=?,updated_at=? WHERE root_id=?",
                 (delivery, now, root_id),
             )
+            _stage(conn, root_id, "delivering")
             kb._append_event(conn, root_id, "factory_quorum_approved", {
                 "candidate_sha": row["candidate_sha"], "delivery_task_id": delivery,
             })
@@ -1095,6 +1530,7 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
                 return _set_error(conn, root_id, draft_error)
         summary = json.dumps({
             "contract": "hermes.factory.receipt.v1",
+            "plan_sha256": row["plan_sha256"],
             "candidate_sha": row["candidate_sha"],
             "reviewer_a": row["reviewer_a_profile"],
             "reviewer_b": row["reviewer_b_profile"],
@@ -1104,6 +1540,7 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
             "tests_run": receipt["tests_run"],
         }, sort_keys=True)
         now = int(time.time())
+        lost_race = False
         with kb.write_txn(conn):
             current = conn.execute(
                 "SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)
@@ -1113,11 +1550,15 @@ def reconcile_factory(conn, root_id: str) -> dict[str, Any]:
                 or current["delivery_task_id"] != row["delivery_task_id"]
                 or current["candidate_sha"] != row["candidate_sha"]
             ):
-                return inspect_factory(conn, root_id)
-            conn.execute(
-                "UPDATE factory_workflows SET state='completing',final_receipt=?,updated_at=? WHERE root_id=?",
-                (summary, now, root_id),
-            )
+                lost_race = True
+            else:
+                conn.execute(
+                    "UPDATE factory_workflows SET state='completing',final_receipt=?,updated_at=? WHERE root_id=?",
+                    (summary, now, root_id),
+                )
+                _stage(conn, root_id, "completing")
+        if lost_race:
+            return inspect_factory(conn, root_id)
         completing = conn.execute(
             "SELECT * FROM factory_workflows WHERE root_id=?", (root_id,)
         ).fetchone()

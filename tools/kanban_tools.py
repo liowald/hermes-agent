@@ -1481,49 +1481,200 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _factory_request_key(args: dict) -> Optional[str]:
+    explicit = str(args.get("idempotency_key") or "").strip()
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+        if platform == "buzz" and chat_id and thread_id:
+            canonical = f"buzz:{chat_id}:{thread_id}"
+            if explicit and explicit != canonical:
+                raise ValueError(
+                    "threaded Buzz work uses the canonical channel/thread "
+                    "idempotency key; omit idempotency_key"
+                )
+            return canonical
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    return explicit or None
+
+
+def _factory_next_gate(receipt: dict) -> str:
+    """Describe the next durable gate from persisted workflow state."""
+    return {
+        "intake": "specification",
+        "planned": "factory adoption",
+        "implementing": "implementation receipt",
+        "reviewing": "two-reviewer quorum",
+        "fixing": "fixer receipt",
+        "delivering": "verified delivery receipt",
+        "completing": "root completion",
+        "blocked": "operator decision and factory retry",
+        "done": "none; factory complete",
+    }.get(str(receipt.get("state") or ""), "factory inspection")
+
+
+def _buzz_subscription_required() -> bool:
+    try:
+        from gateway.session_context import get_session_env
+
+        return bool(
+            get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower() == "buzz"
+            and get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        )
+    except Exception:
+        return False
+
+
 def _handle_factory_create(args: dict, **kw) -> str:
-    """Create one guarded coding factory root from an L1/Buzz request."""
+    """Intake, adopt, or directly create one guarded coding Work Root."""
     delegated_err = _reject_delegated_child_mutation("kanban_factory_create")
     if delegated_err:
         return delegated_err
     guard = _require_orchestrator_tool("kanban_factory_create")
     if guard:
         return guard
+    action = str(args.get("action") or "create").strip().lower()
+    if action not in {"intake", "adopt", "create"}:
+        return tool_error("action must be intake, adopt, or create")
     title = str(args.get("title") or "").strip()
     body = str(args.get("body") or "").strip()
-    if not title or not body:
-        return tool_error("title and body are required")
+    try:
+        request_key = _factory_request_key(args)
+    except ValueError as e:
+        return tool_error(f"kanban_factory_create: {e}")
+    if action == "intake" and not title:
+        return tool_error("title is required for intake")
+    if action == "create" and (not title or not body):
+        return tool_error("title and body are required for direct factory creation")
+    if action != "adopt" and not request_key:
+        return tool_error(
+            "idempotency_key is required outside a threaded Buzz request"
+        )
+    root_id = str(args.get("root_id") or "").strip()
+    if action == "adopt" and not root_id:
+        return tool_error("root_id is required for adoption")
     board = args.get("board")
     try:
         from hermes_cli import kanban_factory as factory
 
         _, conn = _connect(board=board)
         try:
-            receipt = factory.create_factory(
-                conn,
-                title=title,
-                body=body,
-                workspace_kind=str(args.get("workspace_kind") or "worktree"),
-                workspace_path=args.get("workspace_path"),
-                project_id=args.get("project") or args.get("project_id"),
-                executor=str(args.get("executor") or "executor"),
-                reviewer_a=str(args.get("reviewer_a") or "reviewer-a"),
-                reviewer_b=str(args.get("reviewer_b") or "reviewer-b"),
-                fixer=str(args.get("fixer") or "fixer"),
-                priority=int(args.get("priority") or 0),
-                tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-                idempotency_key=args.get("idempotency_key"),
-                created_by=os.environ.get("HERMES_PROFILE") or "l1",
-                delivery_mode=str(args.get("delivery_mode") or "draft_pr"),
-            )
-            subscribed = _maybe_auto_subscribe(conn, receipt["root_id"])
+            common = {
+                "workspace_path": args.get("workspace_path"),
+                "project_id": args.get("project") or args.get("project_id"),
+                "executor": str(args.get("executor") or "executor"),
+                "reviewer_a": str(args.get("reviewer_a") or "reviewer-a"),
+                "reviewer_b": str(args.get("reviewer_b") or "reviewer-b"),
+                "fixer": str(args.get("fixer") or "fixer"),
+                "delivery_mode": str(args.get("delivery_mode") or "draft_pr"),
+            }
+            buzz_required = _buzz_subscription_required()
+            subscribed = False
+            subscription_checked = False
+
+            def intake_root():
+                from tools.async_delegation import _current_origin_session_id
+
+                return factory.create_work_root(
+                    conn,
+                    title=title,
+                    body=body,
+                    workspace_path=common["workspace_path"],
+                    project_id=common["project_id"],
+                    priority=int(args.get("priority") or 0),
+                    tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
+                    idempotency_key=request_key,
+                    created_by=os.environ.get("HERMES_PROFILE") or "l1",
+                    session_id=(
+                        _current_origin_session_id()
+                        or os.environ.get("HERMES_SESSION_ID")
+                    ),
+                )
+
+            if action == "intake" or (action == "create" and buzz_required):
+                receipt = intake_root()
+                root_id = receipt["root_id"]
+                subscribed = _maybe_auto_subscribe(conn, root_id, force=True)
+                subscription_checked = True
+                if buzz_required and not subscribed:
+                    return tool_error(
+                        "Buzz acceptance is not durable because thread subscription "
+                        f"failed; Work Root {root_id} remains held in intake and the "
+                        "same intake/create request can be retried safely"
+                    )
+                if action == "create":
+                    receipt = factory.start_factory_from_root(
+                        conn,
+                        root_id,
+                        workspace_kind=str(args.get("workspace_kind") or "worktree"),
+                        priority=int(args.get("priority") or 0),
+                        tenant=args.get("tenant") or None,
+                        plan_title=title,
+                        plan_body=body,
+                        **common,
+                    )
+            elif action == "adopt":
+                if buzz_required:
+                    if request_key and not factory.work_root_matches_request_key(
+                        conn, root_id, request_key
+                    ):
+                        return tool_error(
+                            "kanban_factory_create: Work Root does not belong to "
+                            "the current Buzz thread"
+                        )
+                    subscribed = _maybe_auto_subscribe(conn, root_id, force=True)
+                    subscription_checked = True
+                    if not subscribed:
+                        return tool_error(
+                            "Buzz acceptance is not durable because thread subscription "
+                            f"failed; Work Root {root_id} was not activated and adoption "
+                            "can be retried safely"
+                        )
+                receipt = factory.start_factory_from_root(
+                    conn,
+                    root_id,
+                    workspace_kind=str(args.get("workspace_kind") or "worktree"),
+                    priority=(
+                        int(args["priority"]) if args.get("priority") is not None else None
+                    ),
+                    tenant=args.get("tenant") or None,
+                    plan_title=title or None,
+                    plan_body=body or None,
+                    **common,
+                )
+            else:
+                receipt = factory.create_factory(
+                    conn,
+                    title=title,
+                    body=body,
+                    workspace_kind=str(args.get("workspace_kind") or "worktree"),
+                    priority=int(args.get("priority") or 0),
+                    tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
+                    idempotency_key=request_key,
+                    created_by=os.environ.get("HERMES_PROFILE") or "l1",
+                    **common,
+                )
+            if not subscription_checked:
+                subscribed = _maybe_auto_subscribe(
+                    conn,
+                    receipt["root_id"],
+                    force=True,
+                )
             return _ok(
                 root_id=receipt["root_id"],
                 state=receipt["state"],
-                implement_task_id=receipt["implement_task_id"],
+                current_step_key=receipt["state"],
+                implement_task_id=receipt.get("implement_task_id"),
                 contract_version=receipt["contract_version"],
                 subscribed=subscribed,
-                next_gate="implementation receipt",
+                accepted=(not buzz_required or subscribed),
+                next_gate=_factory_next_gate(receipt),
             )
         finally:
             conn.close()
@@ -1536,14 +1687,23 @@ def _handle_factory_create(args: dict, **kw) -> str:
 
 def _handle_factory_show(args: dict, **kw) -> str:
     root_id = str(args.get("root_id") or "").strip()
-    if not root_id:
-        return tool_error("root_id is required")
     try:
         from hermes_cli import kanban_factory as factory
 
         _, conn = _connect(board=args.get("board"))
         try:
-            return json.dumps({"ok": True, **factory.inspect_factory(conn, root_id)})
+            if not root_id:
+                from gateway.session_context import get_session_env
+
+                root_id = factory.find_work_root_for_origin(
+                    conn,
+                    platform=get_session_env("HERMES_SESSION_PLATFORM", ""),
+                    chat_id=get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                    thread_id=get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+                ) or ""
+            if not root_id:
+                return tool_error("no Work Root is subscribed to the current origin")
+            return json.dumps({"ok": True, **factory.inspect_work_root(conn, root_id)})
         finally:
             conn.close()
     except ValueError as e:
@@ -1584,7 +1744,12 @@ def _handle_factory_retry(args: dict, **kw) -> str:
         return tool_error(f"kanban_factory_retry: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    force: bool = False,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1593,10 +1758,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     response so an orchestrator can decide whether to fall back to an
     explicit ``kanban_notify-subscribe`` or to polling.
 
-    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). Disable to mirror pre-feature behaviour, e.g. when the
-    originating user/chat opted out via the per-platform notification
-    toggle (see ``hermes dashboard``).
+    Normally gated by ``kanban.auto_subscribe_on_create`` in config.yaml
+    (default True). Guarded Work Roots pass ``force=True`` because a durable
+    origin subscription is part of their acceptance contract.
 
     Subscription paths:
 
@@ -1624,7 +1788,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """
     try:
         cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+        if (
+            not force
+            and not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True)
+        ):
             return False
     except Exception:
         # If config can't load we still default to True — this is the
@@ -1694,6 +1861,23 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+        if platform.lower() == "buzz":
+            existing = next(
+                (
+                    sub
+                    for sub in _kb.list_notify_subs(conn, task_id)
+                    if str(sub.get("platform") or "").lower() == "buzz"
+                    and sub.get("chat_id") == chat_id
+                    and (sub.get("thread_id") or "") == (thread_id or "")
+                ),
+                None,
+            )
+            if (
+                existing
+                and existing.get("delivery_mode") == "notify+wake"
+                and not existing.get("delivery_quarantined_at")
+            ):
+                return True
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
@@ -2454,7 +2638,8 @@ KANBAN_LINK_SCHEMA = {
 KANBAN_FACTORY_CREATE_SCHEMA = {
     "name": "kanban_factory_create",
     "description": (
-        "Queue a durable coding feature through the guarded SDLC factory. "
+        "Intake a durable Work Root, adopt a planned root, or directly queue "
+        "a fully specified feature through the guarded SDLC factory. "
         "The returned root id is the human-facing receipt. The root cannot "
         "complete until implementation, two independent exact-candidate "
         "reviews, any fixer cycle, and final delivery evidence all pass."
@@ -2462,8 +2647,26 @@ KANBAN_FACTORY_CREATE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["intake", "adopt", "create"],
+                "description": (
+                    "intake creates a held Work Root; adopt starts a planned root; "
+                    "create preserves the one-call fully specified factory path."
+                ),
+            },
+            "root_id": {
+                "type": "string",
+                "description": "Managed Work Root id; required for adopt.",
+            },
             "title": {"type": "string"},
-            "body": {"type": "string", "description": "Acceptance criteria and authorized delivery scope."},
+            "body": {
+                "type": "string",
+                "description": (
+                    "Initial request for intake; approved plan and acceptance "
+                    "criteria for adopt/create."
+                ),
+            },
             "workspace_kind": {"type": "string", "enum": ["worktree", "dir"]},
             "workspace_path": {"type": "string"},
             "project": {"type": "string"},
@@ -2473,7 +2676,13 @@ KANBAN_FACTORY_CREATE_SCHEMA = {
             "fixer": {"type": "string"},
             "priority": {"type": "integer"},
             "tenant": {"type": "string"},
-            "idempotency_key": {"type": "string"},
+            "idempotency_key": {
+                "type": "string",
+                "description": (
+                    "Durable request key. Optional in a Buzz thread, where Hermes "
+                    "derives it from the channel and root event."
+                ),
+            },
             "delivery_mode": {
                 "type": "string",
                 "enum": ["draft_pr", "local_commit"],
@@ -2481,7 +2690,7 @@ KANBAN_FACTORY_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "body", "idempotency_key"],
+        "required": [],
     },
 }
 
@@ -2491,10 +2700,13 @@ KANBAN_FACTORY_SHOW_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "root_id": {"type": "string"},
+            "root_id": {
+                "type": "string",
+                "description": "Optional in a subscribed gateway thread; defaults to its Work Root.",
+            },
             "board": _board_schema_prop(),
         },
-        "required": ["root_id"],
+        "required": [],
     },
 }
 

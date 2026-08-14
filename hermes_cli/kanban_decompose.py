@@ -289,6 +289,12 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if task.workflow_template_id == kb.GUARDED_WORK_ROOT_TEMPLATE:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "managed work roots cannot be generically decomposed; specify and adopt the root into the guarded factory",
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -465,4 +471,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id
+        for row in rows
+        if row.workflow_template_id != kb.GUARDED_WORK_ROOT_TEMPLATE
+    ]
