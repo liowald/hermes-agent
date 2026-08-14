@@ -537,6 +537,13 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
         "fixing": ("fixer_task_id",),
         "delivering": ("delivery_task_id",),
     }
+    expected_profiles = {
+        "implement_task_id": "executor_profile",
+        "reviewer_a_task_id": "reviewer_a_profile",
+        "reviewer_b_task_id": "reviewer_b_profile",
+        "fixer_task_id": "fixer_profile",
+        "delivery_task_id": "executor_profile",
+    }
     fields = phase_fields.get(prior)
     if not fields:
         raise ValueError(f"factory state {prior!r} is not retryable")
@@ -558,6 +565,13 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
             if task is None:
                 raise ValueError(f"phase field {field} has no recoverable task")
             if task.status in _TERMINAL:
+                expected_profile = current[expected_profiles[field]]
+                if prior == "reviewing":
+                    verdict, _findings, verdict_error = _review_verdict(
+                        conn, task.id, expected_profile, current["candidate_sha"]
+                    )
+                    if verdict_error is None and verdict is not None:
+                        continue
                 if prior == "delivering":
                     retry_contract = (
                         "Complete with candidate_sha, non-empty tests_run, git_status, "
@@ -586,7 +600,7 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
                     conn,
                     title=f"{task.title} (retry {attempt})",
                     body=body,
-                    assignee=task.assignee,
+                    assignee=expected_profile,
                     created_by=root_id,
                     workspace_kind="dir",
                     workspace_path=task.workspace_path,
@@ -596,16 +610,14 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
                         f"factory:{root_id}:retry:{prior}:{attempt}:{field}"
                     ),
                     max_runtime_seconds=task.max_runtime_seconds,
-                    skills=task.skills,
                     max_retries=task.max_retries,
-                    model_override=task.model_override,
-                    provider_override=task.provider_override,
-                    reasoning_effort=task.reasoning_effort,
                     goal_mode=False,
                     initial_status="running",
                     session_id=task.session_id,
                     project_id=task.project_id,
-                    worker_toolsets=task.worker_toolsets,
+                    worker_toolsets=(
+                        ["factory_review_readonly"] if prior == "reviewing" else None
+                    ),
                 )
                 replacements[field] = replacement
             elif task.status in {"blocked", "scheduled"}:

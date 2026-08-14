@@ -632,6 +632,100 @@ def test_terminal_invalid_review_retry_preserves_read_only_role(factory_env):
         conn.close()
 
 
+def test_review_retry_preserves_valid_changes_verdict(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Preserve changes", body="Do not erase review findings.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:preserve-review-changes",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("after\n")
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+        })
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        reviewer_a = reviewing["reviewer_a_task_id"]
+        reviewer_b = reviewing["reviewer_b_task_id"]
+        _claim_complete(conn, reviewer_a, {
+            "verdict": "changes",
+            "candidate_sha": reviewing["candidate_sha"],
+            "findings": ["repair this"],
+            "verification": ["bundle inspected"],
+        })
+        claimed_b = kb.claim_task(conn, reviewer_b, claimer="reviewer-b")
+        assert claimed_b is not None
+        assert kb.block_task(
+            conn, reviewer_b, reason="temporary reviewer outage", kind="transient",
+            expected_run_id=claimed_b.current_run_id,
+        )
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        assert retried["state"] == "reviewing"
+        assert retried["reviewer_a_task_id"] == reviewer_a
+        assert retried["reviewer_b_task_id"] == reviewer_b
+        assert kb.get_task(conn, reviewer_b).status == "ready"
+        _claim_complete(conn, reviewer_b, {
+            "verdict": "approve",
+            "candidate_sha": reviewing["candidate_sha"],
+            "findings": [],
+            "verification": ["bundle inspected"],
+        })
+        fixing = factory.reconcile_factory(conn, created["root_id"])
+        assert fixing["state"] == "fixing"
+        assert "repair this" in kb.get_task(conn, fixing["fixer_task_id"]).body
+    finally:
+        conn.close()
+
+
+def test_terminal_retry_restores_workflow_role_and_reviewer_toolset(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Restore role", body="Ignore mutable task reassignment.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:restore-retry-role",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("after\n")
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+        })
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        reviewer_a = reviewing["reviewer_a_task_id"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='fixer',worker_toolsets=NULL WHERE id=?",
+                (reviewer_a,),
+            )
+        _claim_complete(conn, reviewer_a, {
+            "verdict": "approve",
+            "candidate_sha": reviewing["candidate_sha"],
+            "findings": [],
+            "verification": ["bundle inspected"],
+        })
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+        assert "is not 'reviewer-a'" in blocked["last_error"]
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        replacement = kb.get_task(conn, retried["reviewer_a_task_id"])
+        assert replacement.id != reviewer_a
+        assert replacement.assignee == "reviewer-a"
+        assert replacement.worker_toolsets == ["factory_review_readonly"]
+    finally:
+        conn.close()
+
+
 def test_terminal_invalid_worktree_implementation_reuses_checkout(factory_env):
     _, repo = factory_env
     conn = kb.connect()
@@ -645,7 +739,8 @@ def test_terminal_invalid_worktree_implementation_reuses_checkout(factory_env):
         original = created["implement_task_id"]
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET workspace_kind='worktree',branch_name=? WHERE id=?",
+                "UPDATE tasks SET workspace_kind='worktree',branch_name=?,assignee='fixer' "
+                "WHERE id=?",
                 (f"reader/{original}", original),
             )
         _claim_complete(conn, original, {
