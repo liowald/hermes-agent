@@ -684,7 +684,7 @@ def test_review_retry_preserves_valid_changes_verdict(factory_env):
         conn.close()
 
 
-def test_terminal_retry_restores_workflow_role_and_reviewer_toolset(factory_env):
+def test_terminal_retry_restores_required_reviewer_toolset(factory_env):
     _, repo = factory_env
     conn = kb.connect()
     try:
@@ -704,7 +704,7 @@ def test_terminal_retry_restores_workflow_role_and_reviewer_toolset(factory_env)
         reviewer_a = reviewing["reviewer_a_task_id"]
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET assignee='fixer',worker_toolsets=NULL WHERE id=?",
+                "UPDATE tasks SET worker_toolsets=NULL WHERE id=?",
                 (reviewer_a,),
             )
         _claim_complete(conn, reviewer_a, {
@@ -715,7 +715,7 @@ def test_terminal_retry_restores_workflow_role_and_reviewer_toolset(factory_env)
         })
         blocked = factory.reconcile_factory(conn, created["root_id"])
         assert blocked["state"] == "blocked"
-        assert "is not 'reviewer-a'" in blocked["last_error"]
+        assert "required read-only toolset" in blocked["last_error"]
 
         retried = factory.retry_factory(conn, created["root_id"])
         replacement = kb.get_task(conn, retried["reviewer_a_task_id"])

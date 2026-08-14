@@ -719,6 +719,11 @@ def _promote_reviews(conn, row, receipt: dict) -> dict[str, Any]:
 
 
 def _review_verdict(conn, task_id: str, profile: str, candidate: str) -> tuple[Optional[str], list, Optional[str]]:
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return None, [], "review task is missing"
+    if task.worker_toolsets != ["factory_review_readonly"]:
+        return None, [], "review task did not run with the required read-only toolset"
     receipt, error = _phase_receipt(conn, task_id, profile)
     if error or receipt is None:
         return None, [], error
