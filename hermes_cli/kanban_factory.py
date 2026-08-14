@@ -564,8 +564,11 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
             task = kb.get_task(conn, task_id) if task_id else None
             if task is None:
                 raise ValueError(f"phase field {field} has no recoverable task")
+            expected_profile = current[expected_profiles[field]]
+            expected_toolsets = (
+                ["factory_review_readonly"] if prior == "reviewing" else None
+            )
             if task.status in _TERMINAL:
-                expected_profile = current[expected_profiles[field]]
                 if prior == "reviewing":
                     verdict, _findings, verdict_error = _review_verdict(
                         conn, task.id, expected_profile, current["candidate_sha"]
@@ -621,10 +624,39 @@ def retry_factory(conn, root_id: str) -> dict[str, Any]:
                 )
                 replacements[field] = replacement
             elif task.status in {"blocked", "scheduled"}:
+                conn.execute(
+                    "UPDATE tasks SET assignee=?,worker_toolsets=?,skills=NULL,"
+                    "model_override=NULL,provider_override=NULL,reasoning_effort=NULL "
+                    "WHERE id=? AND status IN ('blocked','scheduled')",
+                    (
+                        expected_profile,
+                        json.dumps(expected_toolsets) if expected_toolsets else None,
+                        task.id,
+                    ),
+                )
                 if not kb.unblock_task(conn, task.id, allow_nested=True):
                     raise ValueError(f"could not unblock phase {task.id}")
             elif task.status == "triage":
                 raise ValueError(f"phase {task.id} is in triage and needs manual repair")
+            elif (
+                task.assignee != expected_profile
+                or task.worker_toolsets != expected_toolsets
+            ):
+                if task.status == "running":
+                    raise ValueError(
+                        f"running phase {task.id} has a role or capability mismatch; "
+                        "terminate it before retry"
+                    )
+                conn.execute(
+                    "UPDATE tasks SET assignee=?,worker_toolsets=?,skills=NULL,"
+                    "model_override=NULL,provider_override=NULL,reasoning_effort=NULL "
+                    "WHERE id=? AND status IN ('ready','todo','review')",
+                    (
+                        expected_profile,
+                        json.dumps(expected_toolsets) if expected_toolsets else None,
+                        task.id,
+                    ),
+                )
 
         assignments = [
             "state=?", "blocked_from_state=NULL", "last_error=NULL",

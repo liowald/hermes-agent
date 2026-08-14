@@ -684,6 +684,51 @@ def test_review_retry_preserves_valid_changes_verdict(factory_env):
         conn.close()
 
 
+def test_blocked_reviewer_retry_restores_role_before_dispatch(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Restore blocked review", body="Pin before dispatch.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:restore-blocked-reviewer",
+            delivery_mode="local_commit",
+        )
+        (repo / "app.txt").write_text("after\n")
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+        })
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        reviewer_a = reviewing["reviewer_a_task_id"]
+        claimed = kb.claim_task(conn, reviewer_a, claimer="legacy-reviewer")
+        assert claimed is not None
+        assert kb.block_task(
+            conn, reviewer_a, reason="temporary", kind="transient",
+            expected_run_id=claimed.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='fixer',worker_toolsets=NULL,skills='[\"x\"]' "
+                "WHERE id=?",
+                (reviewer_a,),
+            )
+        blocked = factory.reconcile_factory(conn, created["root_id"])
+        assert blocked["state"] == "blocked"
+
+        retried = factory.retry_factory(conn, created["root_id"])
+        restored = kb.get_task(conn, reviewer_a)
+        assert retried["state"] == "reviewing"
+        assert retried["reviewer_a_task_id"] == reviewer_a
+        assert restored.status == "ready"
+        assert restored.assignee == "reviewer-a"
+        assert restored.worker_toolsets == ["factory_review_readonly"]
+        assert restored.skills is None
+    finally:
+        conn.close()
+
+
 def test_terminal_retry_restores_required_reviewer_toolset(factory_env):
     _, repo = factory_env
     conn = kb.connect()
