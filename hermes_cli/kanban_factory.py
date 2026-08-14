@@ -151,9 +151,17 @@ def _require_clean_intake_base(path: Path, expected_sha: str) -> None:
     ).stdout.strip()
     if head != expected_sha or status:
         raise ValueError(
-            "draft_pr factory intake requires a clean checkout at the exact "
-            "origin default-branch commit"
+            "factory intake requires a clean checkout at the exact selected "
+            "base commit"
         )
+
+
+def _workspace_head_sha(path: Path) -> str:
+    """Return the checked-out commit used as the immutable local delivery base."""
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, text=True,
+        capture_output=True, check=True, timeout=15,
+    ).stdout.strip()
 
 
 def _factory_source_repo(
@@ -208,14 +216,16 @@ def create_factory(
     delivery_repo = None
     delivery_base = None
     delivery_base_sha = None
+    source_repo = _factory_source_repo(workspace_path, project_id)
+    if source_repo is None:
+        raise ValueError(
+            f"{delivery_mode} factories require a repository workspace or project"
+        )
     if delivery_mode == "draft_pr":
-        source_repo = _factory_source_repo(workspace_path, project_id)
-        if source_repo is None:
-            raise ValueError(
-                "draft_pr factories require a repository workspace or project"
-            )
         delivery_repo, delivery_base, delivery_base_sha = _workspace_delivery_target(source_repo)
-        _require_clean_intake_base(source_repo, delivery_base_sha)
+    else:
+        delivery_base_sha = _workspace_head_sha(source_repo)
+    _require_clean_intake_base(source_repo, delivery_base_sha)
     existing = conn.execute(
         "SELECT root_id FROM factory_workflows WHERE request_key=?", (request_key,)
     ).fetchone()

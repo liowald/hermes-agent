@@ -98,6 +98,10 @@ hermes kanban factory retry ROOT_ID --json
 ```
 
 Factory creation requires an idempotency key and one authorized delivery mode.
+Both modes require a clean Git repository at intake and bind every review to
+that exact starting commit. This keeps already committed implementation changes
+visible in the review bundle. `draft_pr` additionally requires intake from the
+exact `origin/HEAD` commit.
 `draft_pr` requires an open GitHub draft PR whose reported head matches the
 reviewed Git tree. `local_commit` requires the clean local `HEAD` to have that
 same tree. A blocked phase emits `factory_blocked`; after correcting its cause,

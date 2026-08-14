@@ -336,6 +336,49 @@ def test_factory_rejects_dirty_or_non_default_intake(factory_env):
         conn.close()
 
 
+def test_local_commit_review_bundle_is_based_on_factory_intake(factory_env):
+    _, repo = factory_env
+    conn = kb.connect()
+    try:
+        created = factory.create_factory(
+            conn, title="Review committed change", body="Review the complete commit diff.",
+            workspace_kind="dir", workspace_path=str(repo),
+            idempotency_key="feature:committed-before-review",
+            delivery_mode="local_commit",
+        )
+        intake_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert created["delivery_base_sha"] == intake_sha
+
+        (repo / "app.txt").write_text("committed candidate\n")
+        subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "committed candidate"], cwd=repo,
+            check=True, capture_output=True,
+        )
+        candidate_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        _claim_complete(conn, created["implement_task_id"], {
+            "inspection_only": False,
+            "changed_files": ["app.txt"],
+            "tests_run": ["unit"],
+            "commit_sha": candidate_head,
+        })
+
+        reviewing = factory.reconcile_factory(conn, created["root_id"])
+        assert reviewing["state"] == "reviewing"
+        bundle = json.loads(Path(reviewing["review_bundle_path"]).read_text())
+        assert bundle["base_sha"] == intake_sha
+        assert "-before" in bundle["diff"]
+        assert "+committed candidate" in bundle["diff"]
+    finally:
+        conn.close()
+
+
 def test_concurrent_reconcilers_create_only_one_fixer(factory_env):
     _, repo = factory_env
     conn = kb.connect()
