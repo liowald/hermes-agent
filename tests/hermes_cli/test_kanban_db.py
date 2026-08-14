@@ -430,6 +430,33 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_initially_blocked_task_is_sticky_until_explicit_unblock(kanban_home):
+    """A human-gated card must never enter the dispatch pool on recompute."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="incubation idea",
+            assignee="executor",
+            initial_status="blocked",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.block_recurrences == 1
+        assert [event.kind for event in kb.list_events(conn, task_id)] == [
+            "created",
+            "blocked",
+        ]
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.claim_task(conn, task_id) is None
+
+        assert kb.unblock_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------

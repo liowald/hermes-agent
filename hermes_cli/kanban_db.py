@@ -3794,6 +3794,29 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if initial_status == "blocked":
+                    # A caller that explicitly parks a new card in ``blocked``
+                    # is asking for a human gate, not circuit-breaker recovery.
+                    # Persist the same sticky lifecycle evidence as
+                    # ``block_task(kind="needs_input")``.  Without this event,
+                    # ``recompute_ready`` sees a parentless blocked card as
+                    # recoverable and can dispatch it immediately.
+                    conn.execute(
+                        "UPDATE tasks SET block_kind = 'needs_input', "
+                        "block_recurrences = 1 WHERE id = ?",
+                        (task_id,),
+                    )
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "kind": "needs_input",
+                            "recurrences": 1,
+                            "source_status": "ready",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
