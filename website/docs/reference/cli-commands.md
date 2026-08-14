@@ -58,6 +58,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
 | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
+| `hermes janitor` | Scan cleanup candidates and apply fingerprinted, policy-bounded plans. |
 | `hermes project` | Manage named, multi-folder workspaces (projects). Anchors desktop session grouping and, when bound to a kanban board, gives tasks a deterministic worktree + branch convention. State is per-profile. |
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
 | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
@@ -651,6 +652,25 @@ Board resolution order (highest precedence first): `--board <slug>` flag → `HE
 All actions are also available as a slash command in the gateway (`/kanban …`), with the same argument surface — including `boards` subcommands and the `--board` flag.
 
 For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Gemini Enterprise, eight collaboration patterns, four user stories, concurrency correctness proof — see `docs/hermes-kanban-v1-spec.pdf` in the repository or the [Kanban user guide](/user-guide/features/kanban).
+
+## `hermes janitor`
+
+Create a read-only cleanup inventory, save an exact plan, and apply only
+policy-safe rows whose fingerprints still match:
+
+```bash
+hermes janitor scan --json
+hermes janitor scan --board factory-canary-demo --no-repos \
+  --plan ~/.hermes/janitor/canary-plan.json
+hermes janitor apply --plan ~/.hermes/janitor/canary-plan.json --yes
+hermes janitor restore-board <archived-path> --slug factory-canary-demo --yes
+```
+
+`scan` is always non-mutating. `apply` requires `--yes`; nonrecoverable
+metadata pruning additionally requires `--allow-nonrecoverable`. Worktrees,
+branches, cards, logs, caches, and test artifacts remain review-only unless a
+specific deterministic action is supported. Board archive and restore require
+the gateway to be stopped. See the [Janitor guide](/user-guide/features/janitor).
 
 ## `hermes egress`
 

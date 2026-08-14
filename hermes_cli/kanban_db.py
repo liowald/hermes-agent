@@ -735,6 +735,111 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
+def board_maintenance_marker(board: str) -> Path:
+    """Return the out-of-board marker used for exclusive lifecycle work."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("maintenance markers require a named board")
+    return boards_root() / ".maintenance" / slug
+
+
+def board_archive_tombstone(board: str) -> Path:
+    """Return the durable marker preventing an archived board being recreated."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("archive tombstones require a named board")
+    return boards_root() / ".maintenance" / f"{slug}.archived"
+
+
+def board_lifecycle_lock(board: str) -> Path:
+    """Return the stable cross-process lifecycle lock for a named board."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("lifecycle locks require a named board")
+    return boards_root() / ".maintenance" / f"{slug}.lock"
+
+
+def _named_board_slug_for_db(path: Path) -> Optional[str]:
+    """Resolve a canonical named-board DB path without trusting env overrides."""
+    resolved = path.expanduser().resolve()
+    root = boards_root().resolve()
+    if resolved.name != "kanban.db" or resolved.parent.parent != root:
+        return None
+    return _normalize_board_slug(resolved.parent.name)
+
+
+def clear_stale_board_maintenance_marker(board: str) -> bool:
+    """Remove a dead owner's marker; return False while its owner is live."""
+    marker = board_maintenance_marker(board)
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect board maintenance marker {marker}: {exc}") from exc
+    try:
+        pid = int(raw) if raw else 0
+    except ValueError as exc:
+        raise RuntimeError(f"invalid board maintenance marker {marker}") from exc
+    if pid > 0:
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+        except OSError as exc:
+            raise RuntimeError(f"cannot probe board maintenance owner {pid}: {exc}") from exc
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"cannot remove stale board maintenance marker {marker}: {exc}") from exc
+    return True
+
+
+def _active_board_maintenance_marker(path: Path) -> Optional[Path]:
+    """Return a live lifecycle marker for a named-board DB path, if any.
+
+    The marker lives outside the board directory so it survives an atomic
+    board rename. Stale markers from a dead maintenance process are removed.
+    """
+    slug = _named_board_slug_for_db(path)
+    if not slug:
+        return None
+    tombstone = board_archive_tombstone(slug)
+    try:
+        tombstone_text = tombstone.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect board archive tombstone {tombstone}: {exc}") from exc
+    else:
+        if tombstone_text.startswith("pending:") and path.parent.exists():
+            try:
+                owner = int(tombstone_text.split(":", 1)[1])
+            except ValueError as exc:
+                raise RuntimeError(f"invalid board archive tombstone {tombstone}") from exc
+            try:
+                os.kill(owner, 0)
+                return tombstone
+            except ProcessLookupError:
+                try:
+                    tombstone.unlink()
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"cannot recover stale board archive tombstone {tombstone}: {exc}"
+                    ) from exc
+                return None
+            except PermissionError:
+                return tombstone
+            except OSError as exc:
+                raise RuntimeError(f"cannot probe board archive owner {owner}: {exc}") from exc
+        return tombstone
+    marker = board_maintenance_marker(slug)
+    return None if clear_stale_board_maintenance_marker(slug) else marker
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
@@ -890,34 +995,40 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta = read_board_metadata(slug)
-    # Preserve existing DB-derived fields — they get re-computed each
-    # read but shouldn't be written into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    if description is not None:
-        meta["description"] = str(description)
-    if icon is not None:
-        meta["icon"] = str(icon)
-    if color is not None:
-        meta["color"] = str(color)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if default_workdir is not None:
-        meta["default_workdir"] = str(default_workdir) if default_workdir else None
-    if project_id is not None:
-        meta["project_id"] = str(project_id) if project_id else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+    lifecycle_handle = _acquire_board_lifecycle_handle(
+        board_dir(slug) / "kanban.db", exclusive=False
+    ) if slug != DEFAULT_BOARD else None
+    try:
+        meta = read_board_metadata(slug)
+        # Preserve existing DB-derived fields — they get re-computed each
+        # read but shouldn't be written into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        if description is not None:
+            meta["description"] = str(description)
+        if icon is not None:
+            meta["icon"] = str(icon)
+        if color is not None:
+            meta["color"] = str(color)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if default_workdir is not None:
+            meta["default_workdir"] = str(default_workdir) if default_workdir else None
+        if project_id is not None:
+            meta["project_id"] = str(project_id) if project_id else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        meta["db_path"] = str(kanban_db_path(slug))
+        return meta
+    finally:
+        _release_board_lifecycle_handle(lifecycle_handle)
 
 
 def create_board(
@@ -939,6 +1050,10 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    if normed != DEFAULT_BOARD and board_archive_tombstone(normed).exists():
+        raise ValueError(
+            f"board {normed!r} is archived; restore it instead of recreating the slug"
+        )
     meta = write_board_metadata(
         normed,
         name=name,
@@ -1586,7 +1701,76 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+def _release_board_lifecycle_handle(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _acquire_board_lifecycle_handle(path: Path, *, exclusive: bool) -> Any:
+    """Acquire a lifecycle lock held for a DB connection or board mutation."""
+    slug = _named_board_slug_for_db(path)
+    if not slug:
+        return None
+    lock_path = board_lifecycle_lock(slug)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            # Windows' stdlib exposes only exclusive byte-range locking. Using
+            # it for both modes preserves correctness at the cost of serializing
+            # named-board connections on that platform.
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), mode)
+        marker = _active_board_maintenance_marker(path)
+        if marker is not None and not exclusive:
+            raise RuntimeError(
+                f"kanban board is under exclusive maintenance ({marker}); retry later"
+            )
+        return handle
+    except Exception:
+        _release_board_lifecycle_handle(handle)
+        raise
+
+
+class _KanbanConnection(sqlite3.Connection):
+    """Connection that holds the board lifecycle read lock until close."""
+
+    _hermes_board_lifecycle_handle: Any = None
+
+    def close(self) -> None:
+        handle = getattr(self, "_hermes_board_lifecycle_handle", None)
+        try:
+            super().close()
+        finally:
+            if handle is not None:
+                self._hermes_board_lifecycle_handle = None
+                _release_board_lifecycle_handle(handle)
+
+
+def _sqlite_connect(
+    path: Path,
+    *,
+    lifecycle_handle: Any = None,
+) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting.
 
     Uses ``connect_tracked`` so the live-connection registry knows this file
@@ -1597,17 +1781,31 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = connect_tracked(
-        path,
-        connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-    )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    owned_handle = lifecycle_handle
+    if owned_handle is None:
+        owned_handle = _acquire_board_lifecycle_handle(path, exclusive=False)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        busy_timeout_ms = _resolve_busy_timeout_ms()
+        conn = connect_tracked(
+            path,
+            connect_fn=sqlite3.connect,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+            factory=_KanbanConnection,
+        )
+    except Exception:
+        _release_board_lifecycle_handle(owned_handle)
+        raise
+    conn._hermes_board_lifecycle_handle = owned_handle
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but
+        # set the PRAGMA explicitly so it remains observable. Parameter
+        # binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -2346,6 +2544,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    lifecycle_handle = _acquire_board_lifecycle_handle(path, exclusive=False)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2360,7 +2559,8 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
+        conn = _sqlite_connect(path, lifecycle_handle=lifecycle_handle)
+        lifecycle_handle = None
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -2381,63 +2581,68 @@ def connect(
             raise
         return conn
 
-    with _cross_process_init_lock(path):
-        # Read-only file/sidecar preflight (port of kilocode#12508) —
-        # repair-or-refuse before the header/integrity probes so a stray
-        # read-only kanban.db fails with an actionable message instead of
-        # "attempt to write a readonly database" mid-init.
-        from hermes_state import preflight_db_writability
-        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
-        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-        # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
-        # Full integrity probe — catches corruption past the header (malformed
-        # pages, broken internal metadata). Cached per-path after first success
-        # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
-        resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
-        try:
-            conn.row_factory = sqlite3.Row
-            with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one ERROR log so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                # Bound the WAL file size now that the periodic explicit
-                # checkpoint is PASSIVE (never truncates): on the writer's
-                # natural post-checkpoint reset SQLite trims the -wal file
-                # to this limit. 8 MiB is generous for a kanban board.
-                conn.execute("PRAGMA journal_size_limit=8388608")
-                conn.execute("PRAGMA foreign_keys=ON")
-                # Zero freed pages so a later torn write cannot expose stale
-                # cell content; persisted in the DB header for new DBs.
-                conn.execute("PRAGMA secure_delete=ON")
-                # Surface corrupt cells as read errors instead of silent
-                # wrong-data returns.
-                conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                    # migrations. Cached so subsequent connect() calls in the same
-                    # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
-                    # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
-                    _INITIALIZED_PATHS.add(resolved)
-        except Exception:
-            conn.close()
-            raise
+    try:
+        with _cross_process_init_lock(path):
+            # Read-only file/sidecar preflight (port of kilocode#12508) —
+            # repair-or-refuse before the header/integrity probes so a stray
+            # read-only kanban.db fails with an actionable message instead of
+            # "attempt to write a readonly database" mid-init.
+            from hermes_state import preflight_db_writability
+            preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
+            # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
+            # and other invalid-header cases without opening a sqlite connection.
+            _validate_sqlite_header(path)
+            # Full integrity probe — catches corruption past the header (malformed
+            # pages, broken internal metadata). Cached per-path after first success
+            # via _INITIALIZED_PATHS so it only runs once per process per path.
+            _guard_existing_db_is_healthy(path)
+            resolved = str(path.resolve())
+            conn = _sqlite_connect(path, lifecycle_handle=lifecycle_handle)
+            lifecycle_handle = None
+            try:
+                conn.row_factory = sqlite3.Row
+                with _INIT_LOCK:
+                    # WAL activation can take an exclusive lock while SQLite creates the
+                    # sidecar files for a fresh database. Keep it in the same process-local
+                    # critical section as schema initialization so concurrent gateway
+                    # startup threads do not race before _INITIALIZED_PATHS is populated.
+                    # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+                    # falls back to DELETE with one ERROR log so kanban stays usable there.
+                    # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                    # FULL (was NORMAL): fsync before each checkpoint to narrow the
+                    # crash window that can leave a b-tree page header torn.
+                    conn.execute("PRAGMA synchronous=FULL")
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
+                    # Bound the WAL file size now that the periodic explicit
+                    # checkpoint is PASSIVE (never truncates): on the writer's
+                    # natural post-checkpoint reset SQLite trims the -wal file
+                    # to this limit. 8 MiB is generous for a kanban board.
+                    conn.execute("PRAGMA journal_size_limit=8388608")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    # Zero freed pages so a later torn write cannot expose stale
+                    # cell content; persisted in the DB header for new DBs.
+                    conn.execute("PRAGMA secure_delete=ON")
+                    # Surface corrupt cells as read errors instead of silent
+                    # wrong-data returns.
+                    conn.execute("PRAGMA cell_size_check=ON")
+                    needs_init = resolved not in _INITIALIZED_PATHS
+                    if needs_init:
+                        # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                        # migrations. Cached so subsequent connect() calls in the same
+                        # process are cheap. The lock prevents same-process dispatcher
+                        # threads from racing through the additive ALTER TABLE pass with
+                        # stale PRAGMA snapshots during gateway startup.
+                        conn.executescript(SCHEMA_SQL)
+                        _migrate_add_optional_columns(conn)
+                        _INITIALIZED_PATHS.add(resolved)
+            except Exception:
+                conn.close()
+                raise
+    except Exception:
+        _release_board_lifecycle_handle(lifecycle_handle)
+        raise
     return conn
 
 

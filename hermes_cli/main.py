@@ -11897,6 +11897,11 @@ def main():
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
     build_sync_parser(subparsers, cmd_sync=cmd_sync)
 
+    # Deterministic cleanup inventory and recoverable plan application.
+    from hermes_cli.janitor import build_parser as _build_janitor_parser
+
+    _build_janitor_parser(subparsers)
+
     # =========================================================================
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================

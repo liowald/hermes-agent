@@ -96,6 +96,7 @@ const sidebars: SidebarsConfig = {
             'reference/automation-blueprints-catalog',
             'user-guide/features/delegation',
             'user-guide/features/kanban',
+            'user-guide/features/janitor',
             'user-guide/features/codex-app-server-runtime',
             'user-guide/features/kanban-tutorial',
             'user-guide/features/kanban-worker-lanes',
