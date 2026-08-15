@@ -161,3 +161,21 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_managed_work_root_is_not_decomposed_or_auto_selected(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="managed root",
+            triage=True,
+            workflow_template_id=kb.GUARDED_WORK_ROOT_TEMPLATE,
+            current_step_key="planned",
+        )
+
+    outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "managed work roots" in outcome.reason
+    assert tid not in decomp.list_triage_ids()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+

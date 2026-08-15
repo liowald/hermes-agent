@@ -79,3 +79,51 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+def test_specify_can_hold_managed_root_out_of_dispatch(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="rough managed idea",
+            triage=True,
+            assignee="executor",
+            workflow_template_id=kb.GUARDED_WORK_ROOT_TEMPLATE,
+            current_step_key="intake",
+        )
+        assert kb.specify_triage_task(
+            conn,
+            tid,
+            body="**Goal**\nShip safely.",
+            hold_in_triage=True,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.assignee is None
+        assert task.current_step_key == "planned"
+
+
+def test_hold_in_triage_rejects_an_ordinary_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = _create_triage(conn, title="ordinary idea")
+        with pytest.raises(ValueError, match="reserved for managed work roots"):
+            kb.specify_triage_task(
+                conn,
+                task_id,
+                body="not a factory plan",
+                hold_in_triage=True,
+            )
+        assert kb.get_task(conn, task_id).current_step_key is None
+
+
+def test_managed_root_cannot_be_marked_planned_with_an_empty_body(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="empty managed idea",
+            body="",
+            triage=True,
+            workflow_template_id=kb.GUARDED_WORK_ROOT_TEMPLATE,
+            current_step_key="intake",
+        )
+        with pytest.raises(ValueError, match="plan body cannot be blank"):
+            kb.specify_triage_task(conn, task_id, hold_in_triage=True)
+        assert kb.get_task(conn, task_id).current_step_key == "intake"

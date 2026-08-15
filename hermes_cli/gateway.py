@@ -3362,6 +3362,30 @@ def _strip_optional_systemd_directives(text: str) -> str:
     return "\n".join(filtered)
 
 
+def _normalize_systemd_unit_for_comparison(text: str) -> str:
+    """Ignore caller shim dirs while preserving managed runtime PATH drift."""
+    import re
+
+    normalized = _normalize_service_definition(
+        _strip_optional_systemd_directives(text)
+    )
+
+    def _normalize_path(match: re.Match[str]) -> str:
+        entries = [
+            entry
+            for entry in match.group(1).split(":")
+            if Path(entry.rstrip("/")).name != "shims"
+        ]
+        return f'Environment="PATH={":".join(entries)}"'
+
+    return re.sub(
+        r'^Environment="PATH=([^"\r\n]*)"$',
+        _normalize_path,
+        normalized,
+        flags=re.M,
+    )
+
+
 def _normalize_launchd_plist_for_comparison(text: str) -> str:
     """Normalize launchd plist text for staleness checks.
 
@@ -3410,12 +3434,8 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     # Normalize out directives that older systemd versions silently drop
     # (RestartMaxDelaySec, RestartSteps) so a unit that differs only by
     # those directives is not perpetually flagged as outdated.
-    norm_installed = _normalize_service_definition(
-        _strip_optional_systemd_directives(installed)
-    )
-    norm_expected = _normalize_service_definition(
-        _strip_optional_systemd_directives(expected)
-    )
+    norm_installed = _normalize_systemd_unit_for_comparison(installed)
+    norm_expected = _normalize_systemd_unit_for_comparison(expected)
     return norm_installed == norm_expected
 
 

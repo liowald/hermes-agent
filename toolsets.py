@@ -83,8 +83,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
     "kanban_request_changes",
-    "kanban_heartbeat",
+    "kanban_heartbeat", "kanban_progress",
     "kanban_comment", "kanban_create", "kanban_link",
+    "kanban_factory_create", "kanban_factory_show", "kanban_factory_retry",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
@@ -319,13 +320,14 @@ TOOLSETS = {
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
             "tasks done with structured handoffs, enter first-class review "
             "(request_review — not a block), return review changes, block for human input, "
-            "heartbeat during long ops, comment on threads, attach files, and "
+            "heartbeat during long ops, record semantic progress, comment on "
+            "threads, attach files, and "
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
             "kanban_request_review", "kanban_request_changes",
-            "kanban_heartbeat", "kanban_comment",
+            "kanban_heartbeat", "kanban_progress", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -394,6 +396,17 @@ TOOLSETS = {
         "description": "Safe toolkit without terminal access",
         "tools": [],
         "includes": ["web", "vision", "image_gen"]
+    },
+
+    "factory_review_readonly": {
+        "description": "Read-only repository inspection plus bounded Kanban review verdicts",
+        "internal": True,
+        "tools": [
+            "read_file", "search_files",
+            "kanban_show", "kanban_complete", "kanban_block",
+            "kanban_comment", "kanban_progress", "kanban_factory_show",
+        ],
+        "includes": [],
     },
 
     # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a

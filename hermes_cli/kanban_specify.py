@@ -233,12 +233,18 @@ def specify_task(
             )
 
     with kb.connect_closing() as conn:
+        current = kb.get_task(conn, task_id)
+        hold_in_triage = bool(
+            current
+            and current.workflow_template_id == kb.GUARDED_WORK_ROOT_TEMPLATE
+        )
         ok = kb.specify_triage_task(
             conn,
             task_id,
             title=new_title,
             body=new_body,
             author=author or _profile_author(),
+            hold_in_triage=hold_in_triage,
         )
     if not ok:
         # Race: someone else promoted / archived the task between our
@@ -246,7 +252,12 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, "task moved out of triage before promotion"
         )
-    return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
+    return SpecifyOutcome(
+        task_id,
+        True,
+        "specified and held for factory adoption" if hold_in_triage else "specified",
+        new_title=new_title,
+    )
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

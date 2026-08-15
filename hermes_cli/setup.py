@@ -3191,6 +3191,8 @@ def _blank_slate_minimal_toolsets(config: dict):
         for k, tdef in TOOLSETS.items():
             if k.startswith("hermes-"):
                 continue  # platform composites — not user-facing toolsets
+            if isinstance(tdef, dict) and tdef.get("internal"):
+                continue  # runtime-enforced capability bundles are not setup toggles
             if isinstance(tdef, dict) and tdef.get("includes"):
                 continue  # composite groupings, not leaf toolsets
             if isinstance(tdef, dict) and tdef.get("posture"):

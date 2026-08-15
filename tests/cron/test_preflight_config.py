@@ -62,7 +62,10 @@ class _AuthErrorFactory:
         raise AuthError("No API key configured for provider 'openrouter'")
 
 
-def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
+def _run_job_patched(
+    job, tmp_path, *, resolve=None, skill_view=None,
+    live_delivery_platforms=None,
+):
     """Drive run_job with the standard cron-test seams patched.
 
     Returns (success, output, final_response, error, agent_constructed).
@@ -102,7 +105,9 @@ def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            success, output, final_response, error = run_job(job)
+            success, output, final_response, error = run_job(
+                job, live_delivery_platforms=live_delivery_platforms,
+            )
         agent_constructed = mock_agent_cls.called
     return success, output, final_response, error, agent_constructed
 
@@ -339,4 +344,25 @@ class TestDeliveryPlatform:
                 success, *_rest, agent_constructed = _run_job_patched(job, tmp_path)
 
         assert success is True
+        assert agent_constructed is True
+
+    def test_live_multiplex_adapter_satisfies_secondary_profile_delivery(self, tmp_path):
+        """A secondary profile may use the gateway's connected primary adapter.
+
+        The profile intentionally has no duplicate platform credential; the
+        scheduler must not block its agent before the live adapter delivers.
+        """
+        job = _job(deliver="buzz:reader-channel")
+        disconnected = MagicMock()
+        disconnected.get_connected_platforms.return_value = []
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=disconnected), \
+                 patch("cron.scheduler._is_known_delivery_platform", return_value=True):
+                success, _output, _final, error, agent_constructed = _run_job_patched(
+                    job, tmp_path, live_delivery_platforms={"buzz"},
+                )
+
+        assert success is True
+        assert error is None
         assert agent_constructed is True

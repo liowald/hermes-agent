@@ -142,17 +142,16 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
         "is redelivered on a later tick — it was permanently lost before "
         "this fix (cursor advanced before the best-effort wake)"
     )
-    assert list(runner._kanban_sub_fail_counts.values()) == [1], (
-        "failure counter must bump on a failed wake-only delivery"
+    assert _subs(tid)[0]["delivery_failures"] == 1, (
+        "durable failure counter must bump on a failed wake-only delivery"
     )
     assert len(_subs(tid)) == 1, "one transient failure must not drop the sub"
 
     # Next tick: the same event is claimed and the wake retried.
     runner2 = _make_runner(adapter)
-    runner2._kanban_sub_fail_counts = runner._kanban_sub_fail_counts
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner2))
     assert len(adapter.handled) == 2, "event must be redelivered next tick"
-    assert list(runner2._kanban_sub_fail_counts.values()) == [2]
+    assert _subs(tid)[0]["delivery_failures"] == 2
 
 
 def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
@@ -178,25 +177,31 @@ def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
     # pre-existing task_terminal behavior, unrelated to the wake outcome.)
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
-    """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
+def test_wake_only_failure_cap_quarantines_subscription(tmp_path, monkeypatch):
+    """The failure cap quarantines without deleting the durable return path."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
 
     adapter = FailingWakeAdapter()
     runner = _make_runner(adapter)
-    # Simulate 11 prior consecutive failures (MAX_SEND_FAILURES = 12).
-    runner._kanban_sub_fail_counts = {
-        (tid, "telegram", "chat-1", ""): 11,
-    }
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_failures=11 WHERE task_id=?",
+                (tid,),
+            )
+    finally:
+        conn.close()
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.handled) == 1
-    assert _subs(tid) == [], (
-        "subscription must drop after MAX_SEND_FAILURES consecutive "
-        "wake-only delivery failures, like text sends do"
-    )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "counter entry must clear when the subscription is dropped"
-    )
+    sub = _subs(tid)[0]
+    assert sub["delivery_failures"] == 12
+    assert sub["delivery_quarantined_at"] is not None
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid, include_quarantined=False) == []
+    finally:
+        conn.close()

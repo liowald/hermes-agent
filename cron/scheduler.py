@@ -3903,7 +3903,9 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(
+    job: dict, live_delivery_platforms: Optional[set[str]] = None,
+) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
@@ -3925,6 +3927,10 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     if not platform_parts:
         return None
 
+    live_delivery_platforms = {
+        str(name).strip().lower() for name in (live_delivery_platforms or set())
+        if str(name).strip()
+    }
     connected: Optional[set] = None
     for platform_name in platform_parts:
         if not _is_known_delivery_platform(platform_name):
@@ -3933,6 +3939,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if platform_name.lower() in live_delivery_platforms:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config
@@ -4013,7 +4021,9 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict, cfg: dict, *, live_delivery_platforms: Optional[set[str]] = None,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -4032,7 +4042,10 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        (
+            "delivery",
+            lambda: _preflight_check_delivery(job, live_delivery_platforms),
+        ),
     ):
         try:
             reason = check()
@@ -4176,6 +4189,8 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    live_delivery_platforms: Optional[set[str]] = None,
+    defer_monitor_commit: bool = False,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -4369,6 +4384,7 @@ def run_job(
         # Changed (or first run): inject the monitor context into the prompt
         # through the existing per-run context seam and fall through to a
         # normal agent run.
+        job["_monitor_pending_outcome"] = _mon
         _monitor_context = _mon.context_block
         if _monitor_context:
             extra_prompt = (
@@ -4850,7 +4866,10 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job, _cfg,
+                    live_delivery_platforms=live_delivery_platforms,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -5427,6 +5446,13 @@ def run_job(
             "duration_ms": _audit_duration_ms,
             "error": None,
         })
+        if not defer_monitor_commit:
+            pending_monitor = job.pop("_monitor_pending_outcome", None)
+            if pending_monitor is not None:
+                from cron.monitor import persist_monitor_outcome
+
+                if not persist_monitor_outcome(job_id, pending_monitor):
+                    raise RuntimeError("monitor state persistence failed")
         return True, output, final_response, None
 
     except Exception as e:
@@ -5877,12 +5903,19 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _live_delivery_platforms = {
+            str(getattr(platform, "value", platform)).strip().lower()
+            for platform in (adapters or {})
+            if str(getattr(platform, "value", platform)).strip()
+        }
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
+                    live_delivery_platforms=_live_delivery_platforms,
+                    defer_monitor_commit=True,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -5890,6 +5923,8 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
+                    live_delivery_platforms=_live_delivery_platforms,
+                    defer_monitor_commit=True,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -6129,6 +6164,19 @@ def _run_one_job_body(
                 error="Interrupted by gateway shutdown before terminal completion.",
             )
             return True
+
+        pending_monitor = job.pop("_monitor_pending_outcome", None)
+        monitor_delivery_succeeded = (
+            success
+            and not delivery_error
+            and not (should_deliver and unresolved_origin)
+        )
+        if pending_monitor is not None and monitor_delivery_succeeded:
+            from cron.monitor import persist_monitor_outcome
+
+            if not persist_monitor_outcome(job["id"], pending_monitor):
+                success = False
+                error = "Monitor state persistence failed after delivery."
 
         mark_kwargs = {"delivery_error": delivery_error}
         if fire_owner is not None:

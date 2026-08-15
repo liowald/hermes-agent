@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "worker_toolsets": list(t.worker_toolsets) if t.worker_toolsets else [],
     }
 
 
@@ -600,6 +601,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+
+    p_factory = sub.add_parser(
+        "factory",
+        help="Create, inspect, or deterministically reconcile a guarded coding factory",
+    )
+    p_factory.add_argument(
+        "factory_action",
+        choices=("intake", "adopt", "create", "show", "reconcile", "retry"),
+    )
+    p_factory.add_argument("root_id", nargs="?", default=None)
+    p_factory.add_argument("--title", default=None)
+    p_factory.add_argument("--body", default=None)
+    p_factory.add_argument("--workspace", default="worktree")
+    p_factory.add_argument("--project", default=None)
+    p_factory.add_argument("--executor", default="executor")
+    p_factory.add_argument("--reviewer-a", default="reviewer-a")
+    p_factory.add_argument("--reviewer-b", default="reviewer-b")
+    p_factory.add_argument("--fixer", default="fixer")
+    p_factory.add_argument("--idempotency-key", default=None)
+    p_factory.add_argument(
+        "--delivery-mode", choices=("draft_pr", "local_commit"), default="draft_pr"
+    )
+    p_factory.add_argument("--json", action="store_true")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1126,6 +1150,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "factory":  _cmd_factory,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2306,6 +2331,97 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_factory(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_factory as factory
+
+    action = args.factory_action
+    with kb.connect_closing() as conn:
+        if action == "intake":
+            if not args.title or not args.idempotency_key:
+                print(
+                    "kanban factory intake requires --title and --idempotency-key",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                _ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+            except argparse.ArgumentTypeError as exc:
+                print(f"kanban factory: {exc}", file=sys.stderr)
+                return 2
+            result = factory.create_work_root(
+                conn,
+                title=args.title,
+                body=args.body or "",
+                workspace_path=ws_path,
+                project_id=args.project,
+                idempotency_key=args.idempotency_key,
+                created_by=_profile_author(),
+            )
+        elif action in {"create", "adopt"}:
+            if action == "adopt" and not args.root_id:
+                print("kanban factory adopt requires root_id", file=sys.stderr)
+                return 2
+            if action == "create" and (
+                not args.title or not args.body or not args.idempotency_key
+            ):
+                print(
+                    "kanban factory create requires --title, --body, and --idempotency-key",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+            except argparse.ArgumentTypeError as exc:
+                print(f"kanban factory: {exc}", file=sys.stderr)
+                return 2
+            if ws_kind not in {"worktree", "dir"}:
+                print("kanban factory: workspace must be worktree or dir:<path>", file=sys.stderr)
+                return 2
+            common = {
+                "workspace_kind": ws_kind,
+                "workspace_path": ws_path,
+                "project_id": args.project,
+                "executor": args.executor,
+                "reviewer_a": args.reviewer_a,
+                "reviewer_b": args.reviewer_b,
+                "fixer": args.fixer,
+                "delivery_mode": args.delivery_mode,
+            }
+            result = (
+                factory.start_factory_from_root(conn, args.root_id, **common)
+                if action == "adopt"
+                else factory.create_factory(
+                    conn,
+                    title=args.title,
+                    body=args.body,
+                    idempotency_key=args.idempotency_key,
+                    created_by=_profile_author(),
+                    **common,
+                )
+            )
+        else:
+            if not args.root_id:
+                print(f"kanban factory {action} requires root_id", file=sys.stderr)
+                return 2
+            result = (
+                factory.inspect_work_root(conn, args.root_id)
+                if action == "show"
+                else (
+                    factory.retry_factory(conn, args.root_id)
+                    if action == "retry"
+                    else factory.reconcile_factory(conn, args.root_id)
+                )
+            )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"{result['root_id']}  state={result['state']}  "
+            f"candidate={result.get('candidate_sha') or '-'}"
+        )
+    return 0
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -2583,14 +2699,26 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if purge_ids:
             for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
+                try:
+                    deleted = kb.delete_archived_task(conn, tid)
+                except RuntimeError as exc:
+                    failed.append(tid)
+                    print(f"cannot delete {tid}: {exc}", file=sys.stderr)
+                    continue
+                if not deleted:
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                archived = kb.archive_task(conn, tid)
+            except RuntimeError as exc:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {exc}", file=sys.stderr)
+                continue
+            if not archived:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

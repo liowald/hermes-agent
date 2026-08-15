@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+GUARDED_WORK_ROOT_TEMPLATE = "guarded-work-v1"
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -735,6 +736,97 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
+def board_maintenance_marker(board: str) -> Path:
+    """Return the out-of-board marker used for exclusive lifecycle work."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("maintenance markers require a named board")
+    return boards_root() / ".maintenance" / slug
+
+
+def board_archive_tombstone(board: str) -> Path:
+    """Return the durable marker preventing an archived board being recreated."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("archive tombstones require a named board")
+    return boards_root() / ".maintenance" / f"{slug}.archived"
+
+
+def board_lifecycle_lock(board: str) -> Path:
+    """Return the stable cross-process lifecycle lock for a named board."""
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        raise ValueError("lifecycle locks require a named board")
+    return boards_root() / ".maintenance" / f"{slug}.lock"
+
+
+def _named_board_slug_for_db(path: Path) -> Optional[str]:
+    """Resolve a canonical named-board DB path without trusting env overrides."""
+    resolved = path.expanduser().resolve()
+    root = boards_root().resolve()
+    if resolved.name != "kanban.db" or resolved.parent.parent != root:
+        return None
+    return _normalize_board_slug(resolved.parent.name)
+
+
+def clear_stale_board_maintenance_marker(board: str) -> bool:
+    """Remove a dead owner's marker; return False while its owner is live."""
+    marker = board_maintenance_marker(board)
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect board maintenance marker {marker}: {exc}") from exc
+    try:
+        pid = int(raw) if raw else 0
+    except ValueError as exc:
+        raise RuntimeError(f"invalid board maintenance marker {marker}") from exc
+    if pid > 0 and _pid_alive(pid):
+        return False
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"cannot remove stale board maintenance marker {marker}: {exc}") from exc
+    return True
+
+
+def _active_board_maintenance_marker(path: Path) -> Optional[Path]:
+    """Return a live lifecycle marker for a named-board DB path, if any.
+
+    The marker lives outside the board directory so it survives an atomic
+    board rename. Stale markers from a dead maintenance process are removed.
+    """
+    slug = _named_board_slug_for_db(path)
+    if not slug:
+        return None
+    tombstone = board_archive_tombstone(slug)
+    try:
+        tombstone_text = tombstone.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect board archive tombstone {tombstone}: {exc}") from exc
+    else:
+        if tombstone_text.startswith("pending:") and path.parent.exists():
+            try:
+                owner = int(tombstone_text.split(":", 1)[1])
+            except ValueError as exc:
+                raise RuntimeError(f"invalid board archive tombstone {tombstone}") from exc
+            if _pid_alive(owner):
+                return tombstone
+            try:
+                tombstone.unlink()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot recover stale board archive tombstone {tombstone}: {exc}"
+                ) from exc
+            return None
+        return tombstone
+    marker = board_maintenance_marker(slug)
+    return None if clear_stale_board_maintenance_marker(slug) else marker
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
@@ -890,34 +982,40 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta = read_board_metadata(slug)
-    # Preserve existing DB-derived fields — they get re-computed each
-    # read but shouldn't be written into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    if description is not None:
-        meta["description"] = str(description)
-    if icon is not None:
-        meta["icon"] = str(icon)
-    if color is not None:
-        meta["color"] = str(color)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if default_workdir is not None:
-        meta["default_workdir"] = str(default_workdir) if default_workdir else None
-    if project_id is not None:
-        meta["project_id"] = str(project_id) if project_id else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+    lifecycle_handle = _acquire_board_lifecycle_handle(
+        board_dir(slug) / "kanban.db", exclusive=False
+    ) if slug != DEFAULT_BOARD else None
+    try:
+        meta = read_board_metadata(slug)
+        # Preserve existing DB-derived fields — they get re-computed each
+        # read but shouldn't be written into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        if description is not None:
+            meta["description"] = str(description)
+        if icon is not None:
+            meta["icon"] = str(icon)
+        if color is not None:
+            meta["color"] = str(color)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if default_workdir is not None:
+            meta["default_workdir"] = str(default_workdir) if default_workdir else None
+        if project_id is not None:
+            meta["project_id"] = str(project_id) if project_id else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        meta["db_path"] = str(kanban_db_path(slug))
+        return meta
+    finally:
+        _release_board_lifecycle_handle(lifecycle_handle)
 
 
 def create_board(
@@ -939,6 +1037,10 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    if normed != DEFAULT_BOARD and board_archive_tombstone(normed).exists():
+        raise ValueError(
+            f"board {normed!r} is archived; restore it instead of recreating the slug"
+        )
     meta = write_board_metadata(
         normed,
         name=name,
@@ -1093,6 +1195,9 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    # Dispatcher-enforced capability pin for this task. Unlike profile prose,
+    # this becomes an explicit ``--toolsets`` argument at spawn time.
+    worker_toolsets: Optional[list] = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -1204,6 +1309,11 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            worker_toolsets=(
+                json.loads(row["worker_toolsets"])
+                if "worker_toolsets" in keys and row["worker_toolsets"]
+                else None
+            ),
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
                 row["provider_override"]
@@ -1374,6 +1484,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    worker_toolsets      TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1509,6 +1620,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
+    delivery_failures INTEGER NOT NULL DEFAULT 0,
+    delivery_last_error TEXT,
+    delivery_quarantined_at INTEGER,
+    delivery_claim_cursor INTEGER,
+    delivery_claimed_at INTEGER,
+    delivery_claim_token TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1571,7 +1688,76 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+def _release_board_lifecycle_handle(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _acquire_board_lifecycle_handle(path: Path, *, exclusive: bool) -> Any:
+    """Acquire a lifecycle lock held for a DB connection or board mutation."""
+    slug = _named_board_slug_for_db(path)
+    if not slug:
+        return None
+    lock_path = board_lifecycle_lock(slug)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            # Windows' stdlib exposes only exclusive byte-range locking. Using
+            # it for both modes preserves correctness at the cost of serializing
+            # named-board connections on that platform.
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), mode)
+        marker = _active_board_maintenance_marker(path)
+        if marker is not None and not exclusive:
+            raise RuntimeError(
+                f"kanban board is under exclusive maintenance ({marker}); retry later"
+            )
+        return handle
+    except Exception:
+        _release_board_lifecycle_handle(handle)
+        raise
+
+
+class _KanbanConnection(sqlite3.Connection):
+    """Connection that holds the board lifecycle read lock until close."""
+
+    _hermes_board_lifecycle_handle: Any = None
+
+    def close(self) -> None:
+        handle = getattr(self, "_hermes_board_lifecycle_handle", None)
+        try:
+            super().close()
+        finally:
+            if handle is not None:
+                self._hermes_board_lifecycle_handle = None
+                _release_board_lifecycle_handle(handle)
+
+
+def _sqlite_connect(
+    path: Path,
+    *,
+    lifecycle_handle: Any = None,
+) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting.
 
     Uses ``connect_tracked`` so the live-connection registry knows this file
@@ -1582,17 +1768,31 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = connect_tracked(
-        path,
-        connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-    )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    owned_handle = lifecycle_handle
+    if owned_handle is None:
+        owned_handle = _acquire_board_lifecycle_handle(path, exclusive=False)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        busy_timeout_ms = _resolve_busy_timeout_ms()
+        conn = connect_tracked(
+            path,
+            connect_fn=sqlite3.connect,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+            factory=_KanbanConnection,
+        )
+    except Exception:
+        _release_board_lifecycle_handle(owned_handle)
+        raise
+    conn._hermes_board_lifecycle_handle = owned_handle
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but
+        # set the PRAGMA explicitly so it remains observable. Parameter
+        # binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -2351,6 +2551,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    lifecycle_handle = _acquire_board_lifecycle_handle(path, exclusive=False)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2365,7 +2566,8 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
+        conn = _sqlite_connect(path, lifecycle_handle=lifecycle_handle)
+        lifecycle_handle = None
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -2403,63 +2605,68 @@ def connect(
             path,
         )
 
-    with _cross_process_init_lock(path):
-        # Read-only file/sidecar preflight (port of kilocode#12508) —
-        # repair-or-refuse before the header/integrity probes so a stray
-        # read-only kanban.db fails with an actionable message instead of
-        # "attempt to write a readonly database" mid-init.
-        from hermes_state import preflight_db_writability
-        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
-        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-        # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
-        # Full integrity probe — catches corruption past the header (malformed
-        # pages, broken internal metadata). Cached per-path after first success
-        # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
-        resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
-        try:
-            conn.row_factory = sqlite3.Row
-            with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one ERROR log so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                # Bound the WAL file size now that the periodic explicit
-                # checkpoint is PASSIVE (never truncates): on the writer's
-                # natural post-checkpoint reset SQLite trims the -wal file
-                # to this limit. 8 MiB is generous for a kanban board.
-                conn.execute("PRAGMA journal_size_limit=8388608")
-                conn.execute("PRAGMA foreign_keys=ON")
-                # Zero freed pages so a later torn write cannot expose stale
-                # cell content; persisted in the DB header for new DBs.
-                conn.execute("PRAGMA secure_delete=ON")
-                # Surface corrupt cells as read errors instead of silent
-                # wrong-data returns.
-                conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                    # migrations. Cached so subsequent connect() calls in the same
-                    # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
-                    # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
-                    _INITIALIZED_PATHS.add(resolved)
-        except Exception:
-            conn.close()
-            raise
+    try:
+        with _cross_process_init_lock(path):
+            # Read-only file/sidecar preflight (port of kilocode#12508) —
+            # repair-or-refuse before the header/integrity probes so a stray
+            # read-only kanban.db fails with an actionable message instead of
+            # "attempt to write a readonly database" mid-init.
+            from hermes_state import preflight_db_writability
+            preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
+            # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
+            # and other invalid-header cases without opening a sqlite connection.
+            _validate_sqlite_header(path)
+            # Full integrity probe — catches corruption past the header (malformed
+            # pages, broken internal metadata). Cached per-path after first success
+            # via _INITIALIZED_PATHS so it only runs once per process per path.
+            _guard_existing_db_is_healthy(path)
+            resolved = str(path.resolve())
+            conn = _sqlite_connect(path, lifecycle_handle=lifecycle_handle)
+            lifecycle_handle = None
+            try:
+                conn.row_factory = sqlite3.Row
+                with _INIT_LOCK:
+                    # WAL activation can take an exclusive lock while SQLite creates the
+                    # sidecar files for a fresh database. Keep it in the same process-local
+                    # critical section as schema initialization so concurrent gateway
+                    # startup threads do not race before _INITIALIZED_PATHS is populated.
+                    # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+                    # falls back to DELETE with one ERROR log so kanban stays usable there.
+                    # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                    # FULL (was NORMAL): fsync before each checkpoint to narrow the
+                    # crash window that can leave a b-tree page header torn.
+                    conn.execute("PRAGMA synchronous=FULL")
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
+                    # Bound the WAL file size now that the periodic explicit
+                    # checkpoint is PASSIVE (never truncates): on the writer's
+                    # natural post-checkpoint reset SQLite trims the -wal file
+                    # to this limit. 8 MiB is generous for a kanban board.
+                    conn.execute("PRAGMA journal_size_limit=8388608")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    # Zero freed pages so a later torn write cannot expose stale
+                    # cell content; persisted in the DB header for new DBs.
+                    conn.execute("PRAGMA secure_delete=ON")
+                    # Surface corrupt cells as read errors instead of silent
+                    # wrong-data returns.
+                    conn.execute("PRAGMA cell_size_check=ON")
+                    needs_init = resolved not in _INITIALIZED_PATHS
+                    if needs_init:
+                        # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                        # migrations. Cached so subsequent connect() calls in the same
+                        # process are cheap. The lock prevents same-process dispatcher
+                        # threads from racing through the additive ALTER TABLE pass with
+                        # stale PRAGMA snapshots during gateway startup.
+                        conn.executescript(SCHEMA_SQL)
+                        _migrate_add_optional_columns(conn)
+                        _INITIALIZED_PATHS.add(resolved)
+            except Exception:
+                conn.close()
+                raise
+    except Exception:
+        _release_board_lifecycle_handle(lifecycle_handle)
+        raise
     return conn
 
 
@@ -2614,6 +2821,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
+    if "worker_toolsets" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_toolsets", "worker_toolsets TEXT")
 
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
@@ -2763,6 +2972,36 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "delivery_failures" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_failures",
+                "delivery_failures INTEGER NOT NULL DEFAULT 0",
+            )
+        if "delivery_last_error" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_last_error", "delivery_last_error TEXT"
+            )
+        if "delivery_quarantined_at" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_quarantined_at",
+                "delivery_quarantined_at INTEGER",
+            )
+        if "delivery_claim_cursor" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claim_cursor", "delivery_claim_cursor INTEGER"
+            )
+        if "delivery_claimed_at" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claimed_at", "delivery_claimed_at INTEGER"
+            )
+        if "delivery_claim_token" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "delivery_claim_token", "delivery_claim_token TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2888,7 +3127,10 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " delivery_metadata TEXT, delivery_failures INTEGER NOT NULL DEFAULT 0,"
+        " delivery_last_error TEXT, delivery_quarantined_at INTEGER,"
+        " delivery_claim_cursor INTEGER, delivery_claimed_at INTEGER, delivery_claim_token TEXT,"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -3183,6 +3425,9 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3226,6 +3471,8 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    workflow_template_id = str(workflow_template_id or "").strip() or None
+    current_step_key = str(current_step_key or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3393,6 +3640,14 @@ def create_task(
             )
         skills_list = cleaned
 
+    worker_toolsets_list: Optional[list[str]] = None
+    if worker_toolsets is not None:
+        worker_toolsets_list = list(dict.fromkeys(
+            str(name).strip() for name in worker_toolsets if str(name).strip()
+        ))
+        if not worker_toolsets_list:
+            raise ValueError("worker_toolsets must contain at least one toolset")
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3495,10 +3750,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, worker_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3517,6 +3773,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(worker_toolsets_list) if worker_toolsets_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
@@ -3524,6 +3781,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3549,12 +3808,38 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "worker_toolsets": list(worker_toolsets_list) if worker_toolsets_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if initial_status == "blocked":
+                    # A caller that explicitly parks a new card in ``blocked``
+                    # is asking for a human gate, not circuit-breaker recovery.
+                    # Persist the same sticky lifecycle evidence as
+                    # ``block_task(kind="needs_input")``.  Without this event,
+                    # ``recompute_ready`` sees a parentless blocked card as
+                    # recoverable and can dispatch it immediately.
+                    conn.execute(
+                        "UPDATE tasks SET block_kind = 'needs_input', "
+                        "block_recurrences = 1 WHERE id = ?",
+                        (task_id,),
+                    )
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "kind": "needs_input",
+                            "recurrences": 1,
+                            "source_status": "ready",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3707,6 +3992,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        assert_factory_task_editable(conn, task_id, fields=("assignee",))
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3762,6 +4048,9 @@ def set_model_override(
     if not model:
         provider = None
     with write_txn(conn):
+        assert_factory_task_editable(
+            conn, task_id, fields=("model_override", "provider_override")
+        )
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3801,6 +4090,7 @@ def set_reasoning_effort(
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
+        assert_factory_task_editable(conn, task_id, fields=("reasoning_effort",))
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -4550,6 +4840,13 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            membership = factory_task_membership(conn, task_id)
+            if (
+                membership
+                and membership["role"] == "root"
+                and membership["state"] != "done"
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5359,6 +5656,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    _factory_controller: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5393,6 +5691,9 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    assert_factory_phase_completion(
+        conn, task_id, expected_run_id=expected_run_id,
+    )
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5429,6 +5730,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        assert_factory_root_lifecycle(
+            conn, task_id, factory_controller=_factory_controller
+        )
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6203,6 +6507,7 @@ def block_task(
         )
     recurrences = 0
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6443,6 +6748,7 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -6451,6 +6757,30 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        factory_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='factory_workflows'"
+        ).fetchone()
+        if factory_table is not None:
+            factory_phase = conn.execute(
+                "SELECT root_id, "
+                "CASE WHEN implement_task_id=? THEN 'implementation' "
+                "WHEN fixer_task_id=? THEN 'fixer' "
+                "WHEN delivery_task_id=? THEN 'delivery' "
+                "WHEN reviewer_a_task_id=? THEN 'reviewer-a' "
+                "WHEN reviewer_b_task_id=? THEN 'reviewer-b' END AS role "
+                "FROM factory_workflows WHERE ? IN "
+                "(implement_task_id,fixer_task_id,delivery_task_id,"
+                "reviewer_a_task_id,reviewer_b_task_id) LIMIT 1",
+                (task_id, task_id, task_id, task_id, task_id, task_id),
+            ).fetchone()
+            if factory_phase is not None:
+                return _ret(
+                    False,
+                    "guarded factory phase "
+                    f"{factory_phase['role']!r} must call complete or block; "
+                    "the factory creates separate reviewer cards",
+                )
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -6740,6 +7070,7 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -6806,7 +7137,9 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, allow_nested: bool = False,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -6817,7 +7150,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
+        assert_factory_root_lifecycle(conn, task_id)
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7113,11 +7447,17 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    hold_in_triage: bool = False,
 ) -> bool:
-    """Flesh out a triage task and promote it to ``todo``.
+    """Flesh out a triage task and normally promote it to ``todo``.
+
+    ``hold_in_triage`` is reserved for managed controller roots. It records the
+    approved plan on the same row, clears any assignee, sets the projected step
+    to ``planned``, and deliberately leaves the task in triage so the dispatcher
+    cannot claim it before atomic factory adoption.
 
     Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
+    and normally transitions ``status: triage -> todo`` in a single write txn. Returns
     False when the task is missing or not in the ``triage`` column — callers
     should surface that as "nothing to specify" rather than an error.
 
@@ -7135,12 +7475,26 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title,body,assignee,workflow_template_id FROM tasks "
+            "WHERE id=? AND status='triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        if (
+            hold_in_triage
+            and existing["workflow_template_id"] != GUARDED_WORK_ROOT_TEMPLATE
+        ):
+            raise ValueError("hold_in_triage is reserved for managed work roots")
+        if hold_in_triage:
+            effective_body = body if body is not None else existing["body"]
+            if not str(effective_body or "").strip():
+                raise ValueError("managed work-root plan body cannot be blank")
+        sets: list[str] = (
+            ["status = 'triage'", "assignee = NULL", "current_step_key = 'planned'"]
+            if hold_in_triage
+            else ["status = 'todo'"]
+        )
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -7151,7 +7505,7 @@ def specify_triage_task(
             sets.append("body = ?")
             params.append(body)
             changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
+        if not hold_in_triage and assignee is not None and assignee != (existing["assignee"] or None):
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
@@ -7177,7 +7531,11 @@ def specify_triage_task(
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    + (
+                        " and held for factory adoption."
+                        if hold_in_triage
+                        else " and promoted to todo."
+                    ),
                     int(time.time()),
                 ),
             )
@@ -7185,14 +7543,21 @@ def specify_triage_task(
             conn,
             task_id,
             "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            {
+                "changed_fields": changed_fields,
+                "held_for_factory": True,
+                "current_step_key": "planned",
+            }
+            if hold_in_triage
+            else ({"changed_fields": changed_fields} if changed_fields else None),
         )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    if not hold_in_triage:
+        recompute_ready(conn)
     return True
 
 
@@ -7429,8 +7794,133 @@ def decompose_triage_task(
     return child_ids
 
 
+def factory_task_membership(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the factory workflow/role that durably references ``task_id``."""
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_workflows'"
+    ).fetchone()
+    row = None
+    if table:
+        row = conn.execute(
+            "SELECT root_id,state,implement_task_id,reviewer_a_task_id,reviewer_b_task_id,"
+            "fixer_task_id,delivery_task_id FROM factory_workflows "
+            "WHERE root_id=? OR implement_task_id=? OR reviewer_a_task_id=? "
+            "OR reviewer_b_task_id=? OR fixer_task_id=? OR delivery_task_id=? LIMIT 1",
+            (task_id, task_id, task_id, task_id, task_id, task_id),
+        ).fetchone()
+    if row is None:
+        if table:
+            row = conn.execute(
+                "SELECT f.root_id,f.state FROM factory_workflows f "
+                "JOIN tasks t ON t.id=? AND t.created_by=f.root_id LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "root_id": row["root_id"],
+                    "state": row["state"],
+                    "role": "phase_audit",
+                }
+        held_root = conn.execute(
+            "SELECT id,current_step_key FROM tasks "
+            "WHERE id=? AND workflow_template_id=?",
+            (task_id, GUARDED_WORK_ROOT_TEMPLATE),
+        ).fetchone()
+        if held_root is None:
+            return None
+        return {
+            "root_id": held_root["id"],
+            "state": held_root["current_step_key"] or "intake",
+            "role": "root",
+        }
+    role = "root"
+    for field in (
+        "implement_task_id", "reviewer_a_task_id", "reviewer_b_task_id",
+        "fixer_task_id", "delivery_task_id",
+    ):
+        if row[field] == task_id:
+            role = field.removesuffix("_task_id")
+            break
+    return {"root_id": row["root_id"], "state": row["state"], "role": role}
+
+
+def assert_factory_root_lifecycle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    factory_controller: bool = False,
+) -> None:
+    """Keep a managed Work Root out of generic task lifecycle mutations."""
+    membership = factory_task_membership(conn, task_id)
+    if (
+        membership
+        and membership["role"] == "root"
+        and membership["state"] != "done"
+        and not factory_controller
+    ):
+        raise RuntimeError(
+            f"factory {membership['root_id']} owns the root lifecycle; "
+            "use factory adoption, retry, or reconcile"
+        )
+
+
+def assert_factory_phase_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+) -> None:
+    """Require an active, run-bound worker receipt for factory phases."""
+    membership = factory_task_membership(conn, task_id)
+    if (
+        not membership
+        or membership["role"] == "root"
+        or membership["state"] == "done"
+    ):
+        return
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    current_run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+    if expected_run_id is None or current_run_id != int(expected_run_id):
+        raise RuntimeError(
+            f"factory {membership['root_id']} requires its {membership['role']} "
+            "receipt from the active claimed worker run"
+        )
+
+
+def assert_factory_task_editable(
+    conn: sqlite3.Connection, task_id: str, *, fields: Iterable[str],
+) -> None:
+    """Reject role, capability, and plan edits while a factory is active."""
+    membership = factory_task_membership(conn, task_id)
+    immutable = {
+        "title",
+        "body",
+        "assignee",
+        "model_override",
+        "provider_override",
+        "reasoning_effort",
+        "worker_toolsets",
+    }
+    changed = set(fields) & immutable
+    if membership and membership["state"] != "done" and changed:
+        raise RuntimeError(
+            f"factory {membership['root_id']} is active; {membership['role']} "
+            f"fields are controller-owned: {', '.join(sorted(changed))}"
+        )
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership and membership["state"] != "done":
+            raise RuntimeError(
+                f"factory {membership['root_id']} is active; its "
+                f"{membership['role']} card cannot be archived"
+            )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7463,6 +7953,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership:
+            raise RuntimeError(
+                f"factory audit {membership['root_id']} references this "
+                f"{membership['role']} card; permanent deletion is refused"
+            )
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7492,6 +7988,12 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        membership = factory_task_membership(conn, task_id)
+        if membership:
+            raise RuntimeError(
+                f"factory audit {membership['root_id']} references this "
+                f"{membership['role']} card; permanent deletion is refused"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7842,6 +8344,7 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        assert_factory_root_lifecycle(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8325,6 +8828,43 @@ def heartbeat_worker(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,
             run_id=run_id,
+        )
+    return True
+
+
+def record_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Record run-bound semantic progress and refresh worker liveness."""
+    text = str(summary or "").strip()
+    if not text:
+        raise ValueError("progress summary is required")
+    if expected_run_id is None:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at=? "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (now, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at=? "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (now, int(expected_run_id), task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "progress",
+            {"summary": text[:2000]},
+            run_id=int(expected_run_id),
         )
     return True
 
@@ -10502,7 +11042,7 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = task.worker_toolsets or _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -11039,6 +11579,11 @@ def add_notify_sub(
     messages (issue #29905). Subscribers only want events that occur
     AFTER they subscribe; the gateway/tool auto-subscribe paths run at
     task creation, where the snapshot is 0 anyway.
+
+    Re-subscribing is also the explicit recovery action for a quarantined
+    destination. It preserves the failed-event cursor while clearing the
+    persisted failure state, so the next notifier tick retries exactly the
+    undelivered suffix rather than replaying the whole history.
     """
     insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
         # api_server is stateless: the adapter has no send() — the wake
@@ -11129,6 +11674,13 @@ def add_notify_sub(
                 """,
                 (metadata_json, task_id, platform, chat_id, thread_id or ""),
             )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_failures=0,"
+            "delivery_last_error=NULL,delivery_quarantined_at=NULL,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
 
 
 def _notify_profile_filter(
@@ -11167,6 +11719,7 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_quarantined: bool = True,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -11186,6 +11739,8 @@ def list_notify_subs(
     if owner_where:
         where.append(owner_where)
         params.extend(owner_params)
+    if not include_quarantined:
+        where.append("delivery_quarantined_at IS NULL")
     sql = "SELECT * FROM kanban_notify_subs"
     if where:
         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
@@ -11207,6 +11762,7 @@ def count_notify_subs(
     board: Optional[str] = None,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_quarantined: bool = True,
     platform: Optional[str] = None,
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
@@ -11245,6 +11801,8 @@ def count_notify_subs(
             if owner_where:
                 clauses.append(f"({owner_where})")
                 params.extend(owner_params)
+            if not include_quarantined:
+                clauses.append("delivery_quarantined_at IS NULL")
             if platform is not None:
                 clauses.append("LOWER(platform) = LOWER(?)")
                 params.append(platform)
@@ -11386,30 +11944,33 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
-) -> tuple[int, int, list[Event]]:
+) -> tuple[int, int, Optional[str], list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
-    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
-    ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
-    processes pointed at the same board DB: concurrent watchers serialize on
-    SQLite's writer lock, and only the first process sees and claims a given
-    event range.
-
-    Callers should send the claimed events, then either leave the cursor at
-    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
-    failed before any terminal unsubscribe removed the row.
+    Returns ``(old_cursor, claim_cursor, claim_token, events)``. The durable delivered
+    cursor does not move until :func:`advance_notify_cursor` succeeds with the
+    matching claim. This in-flight lease prevents a second watcher from
+    claiming later events while the first is still sending, which otherwise
+    permits both event loss and a late-success cursor rewind.
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            "SELECT last_event_id,delivery_claim_cursor,delivery_claimed_at,delivery_claim_token "
+            "FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_quarantined_at IS NULL",
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
-            return 0, 0, []
+            return 0, 0, None, []
         old_cursor = int(row["last_event_id"])
+        now = int(time.time())
+        lease_cutoff = now - 300
+        if (
+            row["delivery_claim_cursor"] is not None
+            and int(row["delivery_claimed_at"] or 0) >= lease_cutoff
+        ):
+            return old_cursor, old_cursor, None, []
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -11419,14 +11980,21 @@ def claim_unseen_events_for_sub(
             kinds=kinds,
         )
         if not events:
-            return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            return old_cursor, old_cursor, None, []
+        claim_token = secrets.token_hex(16)
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_claim_cursor=?,delivery_claimed_at=?,"
+            "delivery_claim_token=? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "AND last_event_id=? AND (delivery_claim_cursor IS NULL OR delivery_claimed_at<?)",
+            (
+                int(new_cursor), now, claim_token, task_id, platform, chat_id,
+                thread_id or "", int(old_cursor), lease_cutoff,
+            ),
         )
-        return old_cursor, new_cursor, events
+        if cur.rowcount != 1:
+            return old_cursor, old_cursor, None, []
+        return old_cursor, new_cursor, claim_token, events
 
 
 def advance_notify_cursor(
@@ -11437,13 +12005,20 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
-) -> None:
+    claim_token: str,
+) -> bool:
     with write_txn(conn):
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_claim_cursor=? AND delivery_claim_token=?",
+            (
+                int(new_cursor), task_id, platform, chat_id,
+                thread_id or "", int(new_cursor), str(claim_token),
+            ),
         )
+    return cur.rowcount > 0
 
 
 def rewind_notify_cursor(
@@ -11455,24 +12030,134 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    claim_token: str,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
-    The CAS guard only rewinds if no later notifier advanced the row after our
-    claim. This keeps retry behavior for transient send failures without
-    clobbering newer progress.
+    The CAS guard releases only the matching in-flight lease.
     """
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
+            "AND delivery_claim_cursor = ? AND delivery_claim_token = ?",
             (
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
-                int(claimed_cursor),
+                int(claimed_cursor), str(claim_token),
             ),
         )
     return cur.rowcount > 0
+
+
+def record_notify_delivery_success(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claim_token: Optional[str] = None,
+    outbound_message_id: Optional[str] = None,
+    event_kind: Optional[str] = None,
+    event_id: Optional[int] = None,
+) -> bool:
+    """Commit delivery evidence and per-event cursor progress atomically."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_metadata FROM kanban_notify_subs "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        metadata = _decode_notify_delivery_metadata(
+            row["delivery_metadata"] if row else None
+        )
+        if outbound_message_id:
+            metadata["last_delivery_message_id"] = str(outbound_message_id)
+        if event_kind:
+            metadata["last_delivery_event_kind"] = str(event_kind or "")
+        if event_id is not None:
+            metadata["last_delivery_event_id"] = int(event_id)
+        if claim_token is not None and event_id is not None:
+            cur = conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_failures=0,"
+                "delivery_last_error=NULL,delivery_metadata=?,"
+                "last_event_id=MAX(last_event_id,?) "
+                "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+                "AND delivery_quarantined_at IS NULL "
+                "AND delivery_claim_token=? AND delivery_claim_cursor>=?",
+                (
+                    _encode_notify_delivery_metadata(metadata), int(event_id),
+                    task_id, platform, chat_id, thread_id or "",
+                    str(claim_token), int(event_id),
+                ),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_failures=0,"
+                "delivery_last_error=NULL,delivery_metadata=? "
+                "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+                "AND delivery_quarantined_at IS NULL "
+                "AND (? IS NULL OR delivery_claim_token=?)",
+                (
+                    _encode_notify_delivery_metadata(metadata),
+                    task_id, platform, chat_id, thread_id or "",
+                    claim_token, claim_token,
+                ),
+            )
+    return cur.rowcount > 0
+
+
+def record_notify_delivery_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    claim_token: str,
+    retry_cursor: int,
+    error: str,
+    quarantine_after: int = 12,
+) -> tuple[int, bool]:
+    """Rewind a failed claim and persist a bounded delivery quarantine.
+
+    ``retry_cursor`` is the last event that actually delivered from the
+    claimed batch. The failed suffix stays pending. Once the bounded retry
+    budget is exhausted, the subscription remains durable but is excluded
+    from notifier polling until an explicit re-subscribe clears quarantine.
+    """
+    limit = max(1, int(quarantine_after))
+    now = int(time.time())
+    message = str(error or "delivery failed")[:500]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id=?,"
+            "delivery_failures=COALESCE(delivery_failures,0)+1,"
+            "delivery_last_error=?,"
+            "delivery_quarantined_at=CASE "
+            "WHEN COALESCE(delivery_failures,0)+1>=? "
+            "THEN COALESCE(delivery_quarantined_at,?) "
+            "ELSE delivery_quarantined_at END,"
+            "delivery_claim_cursor=NULL,delivery_claimed_at=NULL,delivery_claim_token=NULL "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+            "AND delivery_claim_cursor=? AND delivery_claim_token=?",
+            (
+                int(retry_cursor), message, limit, now, task_id, platform,
+                chat_id, thread_id or "", int(claimed_cursor), str(claim_token),
+            ),
+        )
+        row = conn.execute(
+            "SELECT delivery_failures,delivery_quarantined_at "
+            "FROM kanban_notify_subs WHERE task_id=? AND platform=? "
+            "AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+    if cur.rowcount == 0 or row is None:
+        return 0, False
+    failures = int(row["delivery_failures"] or 0)
+    return failures, row["delivery_quarantined_at"] is not None
 
 
 # ---------------------------------------------------------------------------

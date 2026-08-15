@@ -78,6 +78,98 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_monitor_baseline_commits_only_after_successful_delivery(monkeypatch):
+    from cron import monitor
+
+    commits = []
+    delivery_error = {"value": "buzz unavailable"}
+
+    def fake_run_job(job, **_kwargs):
+        job["_monitor_pending_outcome"] = monitor.MonitorOutcome(
+            ok=True,
+            changed=True,
+            output_hash="new-state",
+            output="anomaly",
+        )
+        return True, "out", "alert", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *_args, **_kwargs: delivery_error["value"],
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(s, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        monitor,
+        "persist_monitor_outcome",
+        lambda job_id, outcome: commits.append((job_id, outcome.output_hash)) or True,
+    )
+
+    assert s.run_one_job({"id": "monitor", "deliver": "buzz"}) is True
+    assert commits == []
+
+    delivery_error["value"] = None
+    assert s.run_one_job({"id": "monitor", "deliver": "buzz"}) is True
+    assert commits == [("monitor", "new-state")]
+
+
+def test_monitor_persistence_failure_marks_run_failed(monkeypatch):
+    from cron import monitor
+
+    marked = []
+    finished = []
+
+    def fake_run_job(job, **_kwargs):
+        job["_monitor_pending_outcome"] = monitor.MonitorOutcome(
+            ok=True,
+            changed=True,
+            output_hash="new-state",
+            output="anomaly",
+        )
+        return True, "out", "alert", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+    monkeypatch.setattr(monitor, "persist_monitor_outcome", lambda *_args: False)
+
+    assert s.run_one_job({"id": "monitor", "deliver": "buzz"}) is True
+
+    assert marked[-1][0][1:] == (
+        False,
+        "Monitor state persistence failed after delivery.",
+    )
+    assert finished[-1][1]["success"] is False
+    assert finished[-1][1]["delivery_outcome"] == "delivered"
+
+
+def test_monitor_snapshot_failure_does_not_persist_hash(monkeypatch):
+    from cron import monitor
+
+    updated = []
+    monkeypatch.setattr(monitor, "_write_last_output", lambda *_args: False)
+    monkeypatch.setattr(
+        "cron.jobs.update_job",
+        lambda *args, **kwargs: updated.append((args, kwargs)),
+    )
+
+    assert monitor._persist_monitor_state("monitor", "new-state", "anomaly") is False
+    assert updated == []
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -251,6 +343,28 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
     ]
 
 
+def test_run_one_job_passes_live_adapter_platforms_to_preflight(monkeypatch):
+    observed = {}
+
+    def fake_run_job(job, *, defer_agent_teardown=None, **kwargs):
+        observed["platforms"] = kwargs.get("live_delivery_platforms")
+        return (True, "out", "final", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *args, **kwargs: None)
+
+    class BuzzPlatform:
+        value = "buzz"
+
+    assert s.run_one_job(
+        {"id": "j-live-buzz", "name": "watcher"},
+        adapters={BuzzPlatform(): object()},
+    )
+    assert observed["platforms"] == {"buzz"}
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -292,5 +406,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-

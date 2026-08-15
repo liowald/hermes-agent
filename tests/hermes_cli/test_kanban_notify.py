@@ -81,6 +81,37 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
         conn.close()
 
 
+def test_successful_buzz_delivery_persists_id_only_receipt(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="receipt task")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="root-event",
+            delivery_metadata={"thread_id": "root-event"},
+        )
+        kb.record_notify_delivery_success(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            thread_id="root-event",
+            outbound_message_id="visible-event",
+            event_kind="completed",
+            event_id=42,
+        )
+        metadata = kb.list_notify_subs(conn, tid)[0]["delivery_metadata"]
+        assert metadata["thread_id"] == "root-event"
+        assert metadata["last_delivery_message_id"] == "visible-event"
+        assert metadata["last_delivery_event_kind"] == "completed"
+        assert metadata["last_delivery_event_id"] == 42
+    finally:
+        conn.close()
+
+
 def test_child_task_inherits_parent_delivery_mode(kanban_home):
     """Graph children inherit the parent's ACK edge AND its delivery_mode."""
     import hermes_cli.kanban_db as kb
@@ -174,6 +205,222 @@ def test_notify_sub_user_id_alt_persists_and_backfills_legacy_rows(kanban_home):
     assert subs[0]["user_id_alt"] == "union-id"
 
 
+def test_notify_failure_preserves_partial_cursor_and_quarantines(kanban_home):
+    """A poison event cannot replay an earlier success or spin forever."""
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quarantine sub", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "status", {"status": "review"})
+            first = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            kb._append_event(conn, tid, "completed", {"summary": "done"})
+            second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        old_cursor, claimed_cursor, claim_token, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert [event.id for event in events] == [first, second]
+        failures, quarantined = kb.record_notify_delivery_failure(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            claimed_cursor=claimed_cursor,
+            claim_token=claim_token,
+            retry_cursor=first,
+            error="unknown mention",
+            quarantine_after=2,
+        )
+        assert (failures, quarantined) == (1, False)
+
+        old_cursor, claimed_cursor, claim_token, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert old_cursor == first
+        assert [event.id for event in events] == [second]
+        failures, quarantined = kb.record_notify_delivery_failure(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            claimed_cursor=claimed_cursor,
+            claim_token=claim_token,
+            retry_cursor=first,
+            error="unknown mention",
+            quarantine_after=2,
+        )
+        assert (failures, quarantined) == (2, True)
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == first
+        assert sub["delivery_last_error"] == "unknown mention"
+        assert sub["delivery_quarantined_at"] is not None
+        assert kb.list_notify_subs(conn, tid, include_quarantined=False) == []
+        assert kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        ) == (0, 0, None, [])
+
+        # Explicit re-subscribe is the recovery action. It keeps the failed
+        # suffix pending and clears only the delivery quarantine.
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == first
+        assert sub["delivery_failures"] == 0
+        assert sub["delivery_quarantined_at"] is None
+        old_cursor, _claimed_cursor, _claim_token, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert old_cursor == first
+        assert [event.id for event in events] == [second]
+    finally:
+        conn.close()
+
+
+def test_notify_claim_lease_prevents_loss_and_late_cursor_rewind(kanban_home):
+    """Only one watcher owns a batch; stale completions cannot move its cursor."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="leased sub", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "status", {"status": "review"})
+            first = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        old, first_claim, first_token, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert [event.id for event in events] == [first]
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "completed", {"summary": "done"})
+            second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        assert kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        ) == (old, old, None, [])
+        assert kb.advance_notify_cursor(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            new_cursor=first_claim,
+            claim_token=first_token,
+        )
+        old2, second_claim, second_token, events2 = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert old2 == first
+        assert second_claim == second
+        assert [event.id for event in events2] == [second]
+
+        assert not kb.advance_notify_cursor(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            new_cursor=first_claim,
+            claim_token=first_token,
+        )
+        assert kb.advance_notify_cursor(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            new_cursor=second_claim,
+            claim_token=second_token,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == second
+    finally:
+        conn.close()
+
+
+def test_delivery_receipt_advances_each_event_before_batch_commit(kanban_home):
+    """A restart after one send resumes at the undelivered batch suffix."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="partial delivery", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "status", {"status": "review"})
+            first = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            kb._append_event(conn, tid, "completed", {"summary": "done"})
+            second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        old, cursor, token, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert [event.id for event in events] == [first, second]
+        assert kb.record_notify_delivery_success(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            claim_token=token,
+            outbound_message_id="buzz-message-1",
+            event_kind="status",
+            event_id=first,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == first
+        assert sub["delivery_claim_cursor"] == cursor
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_claimed_at=0 WHERE task_id=?",
+                (tid,),
+            )
+        resumed_old, resumed_cursor, resumed_token, resumed_events = (
+            kb.claim_unseen_events_for_sub(
+                conn, task_id=tid, platform="buzz", chat_id="reader",
+            )
+        )
+        assert resumed_old == first
+        assert resumed_cursor == second
+        assert [event.id for event in resumed_events] == [second]
+        assert resumed_token != token
+        assert not kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="buzz",
+            chat_id="reader",
+            new_cursor=cursor,
+            claim_token=token,
+        )
+    finally:
+        conn.close()
+
+
+def test_expired_replacement_claim_rejects_stale_same_cursor_owner(kanban_home):
+    """A claim generation, not its cursor, owns failure/success mutations."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="claim generation", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="buzz", chat_id="reader")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "completed", {"summary": "done"})
+        old, cursor_a, token_a, events_a = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert events_a and token_a
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_claimed_at=0 WHERE task_id=?",
+                (tid,),
+            )
+        old_b, cursor_b, token_b, events_b = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+        )
+        assert (old_b, cursor_b) == (old, cursor_a)
+        assert events_b and token_b and token_b != token_a
+
+        assert kb.record_notify_delivery_failure(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            claimed_cursor=cursor_a, claim_token=token_a,
+            retry_cursor=old, error="stale owner",
+        ) == (0, False)
+        assert kb.advance_notify_cursor(
+            conn, task_id=tid, platform="buzz", chat_id="reader",
+            new_cursor=cursor_b, claim_token=token_b,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == cursor_b
+        assert sub["delivery_failures"] == 0
+    finally:
+        conn.close()
+
+
 def test_child_task_inherits_parent_chat_type(kanban_home):
     """Graph children inherit the parent's chat_type alongside its ACK edge and
     delivery_mode, so a woken child notification keys to the same session as
@@ -220,7 +467,12 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             delivery_mode="notify+wake",
         )
         kb.block_task(conn, passive_tid, reason="passive block")
-        kb.block_task(conn, active_tid, reason="active block")
+        kb._append_event(
+            conn,
+            active_tid,
+            kind="factory_blocked",
+            payload={"reason": "review evidence needs an operator"},
+        )
     finally:
         conn.close()
 
@@ -259,10 +511,11 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     # Both subs still get a passive send (notify AND notify+wake send).
     assert len(sent_msgs) == 2
     assert any("passive block" in m for m in sent_msgs)
-    assert any("active block" in m for m in sent_msgs)
+    assert any("Factory" in m and "operator action required" in m for m in sent_msgs)
     # Only the notify+wake sub woke the agent, exactly once.
     wake_mock.assert_awaited_once()
     assert active_tid in wake_mock.await_args.kwargs["text"]
+    assert "factory needs an operator decision" in wake_mock.await_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

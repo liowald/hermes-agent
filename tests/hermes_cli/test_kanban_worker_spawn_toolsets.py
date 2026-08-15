@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 
 
-def _make_task(kb, *, assignee: str):
+def _make_task(kb, *, assignee: str, worker_toolsets=None):
     return kb.Task(
         id="t_spawn_tools",
         title="spawn tools",
@@ -21,6 +21,7 @@ def _make_task(kb, *, assignee: str):
         claim_expires=None,
         tenant=None,
         current_run_id=7,
+        worker_toolsets=worker_toolsets,
     )
 
 
@@ -87,6 +88,47 @@ agent:
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
+
+
+def test_default_spawn_task_toolsets_override_profile_capabilities(monkeypatch, tmp_path):
+    """A factory reviewer cannot inherit the reviewer's broader profile tools."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "reviewer-a"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n    - file\n    - kanban\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(
+        kb,
+        assignee="reviewer-a",
+        worker_toolsets=["factory_review_readonly"],
+    )
+    pid = kb._default_spawn(task, str(workspace))
+
+    assert pid == 4243
+    assert captured["cmd"][captured["cmd"].index("--toolsets") + 1] == (
+        "factory_review_readonly"
+    )
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):

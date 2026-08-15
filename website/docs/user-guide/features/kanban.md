@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_progress`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_factory_create`, `kanban_factory_show`, `kanban_factory_retry`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -68,6 +68,77 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Guarded coding factory
+
+For intake that starts as an idea and becomes an approved plan, keep one
+human-facing card through the whole lifecycle:
+
+```bash
+hermes kanban factory intake \
+  --title "Add the export flow" \
+  --body "Initial request and constraints" \
+  --workspace dir:/absolute/repository/path \
+  --idempotency-key feature:add-export
+
+hermes kanban specify ROOT_ID
+hermes kanban factory adopt ROOT_ID \
+  --workspace dir:/absolute/repository/path \
+  --delivery-mode local_commit
+```
+
+`intake` creates a managed Work Root in triage. Specification updates the same
+card and holds it out of dispatch. `adopt` freezes the plan, stores its SHA-256
+digest, and atomically starts the implementation phase. Repeating intake or
+adoption returns the existing root. See [Agent OS work roots](./agent-os-work-roots.md)
+for the complete human-facing receipt and recovery contract.
+
+Use the factory when a coding request must not become human-visible `done`
+after a single worker phase:
+
+```bash
+hermes kanban factory create \
+  --title "Add the export flow" \
+  --body "Acceptance criteria and authorized delivery scope" \
+  --workspace dir:/absolute/repository/path \
+  --idempotency-key feature:add-export
+```
+
+The returned root id is the durable receipt. The controller creates separate
+cards for the executor, reviewer A, reviewer B, fixer (only when either review
+requests changes), and final delivery. Reviewers receive a read-only toolset
+and must approve the same content fingerprint. A fix creates a new fingerprint
+and invalidates both prior approvals. A persistent SQLite trigger rejects any
+attempt to complete the root before the delivery receipt passes.
+Factory implementation and fixer cards finish with `complete`; the ordinary
+same-card `request-review` transition is rejected because it would bypass the
+two separate reviewer cards.
+
+Inspect or advance the deterministic controller with:
+
+```bash
+hermes kanban factory show ROOT_ID --json
+hermes kanban factory reconcile ROOT_ID --json
+hermes kanban factory retry ROOT_ID --json
+```
+
+Factory creation requires an idempotency key and one authorized delivery mode.
+Both modes require a clean Git repository at intake and bind every review to
+that exact starting commit. This keeps already committed implementation changes
+visible in the review bundle. `draft_pr` additionally requires intake from the
+exact `origin/HEAD` commit.
+`draft_pr` requires an open GitHub draft PR whose reported head matches the
+reviewed Git tree. `local_commit` requires the clean local `HEAD` to have that
+same tree. A blocked phase emits `factory_blocked`; after correcting its cause,
+`factory retry` resumes a nonterminal phase. If a terminal phase supplied an
+invalid receipt, retry creates exactly one replacement card with the same role
+and workspace while retaining the rejected card as audit evidence.
+
+For chat-originated work, `kanban_factory_create` auto-subscribes the source
+conversation and returns the root id, current state, implementation phase id,
+and next gate. The same orchestrator can call `kanban_factory_retry` after the
+reported blocker is corrected. Heartbeats and child completions are phase
+evidence only; they are never a factory completion receipt.
 
 ## Boards (multi-project)
 
@@ -301,6 +372,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
+| `kanban_progress` | Record one concise, run-bound semantic milestone. This also refreshes the worker claim, but unlike a heartbeat it is durable evidence that a finding, verification step, or implementation milestone changed. | `summary` |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
@@ -316,6 +388,8 @@ A typical worker turn looks like:
 kanban_show()                                     # no args — uses HERMES_KANBAN_TASK
 # (model reads the returned worker_context, does the work via terminal/file tools)
 kanban_heartbeat(note="halfway through — 4 of 8 files transformed")
+# Long inspection or verification with no repository changes:
+kanban_progress(summary="verified migration rollback against the copied database")
 # (more work)
 kanban_complete(
     summary="migrated limiter.py to token-bucket; added 14 tests, all pass",
@@ -399,7 +473,8 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
-4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
+4. When a long-running review or verification reaches a real milestone without changing repository bytes, call `kanban_progress(summary="...")`. Use this only for new semantic evidence; repeated heartbeats or activity narration are not progress.
+5. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
 
 That final `kanban_complete` / `kanban_block` call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
@@ -889,6 +964,13 @@ bot> ✓ t_9fc1a3 completed by transcriber
 
 Subscriptions survive a task reaching `done` — completion is reversible (a reviewer or controller can reopen a done task), so the origin session keeps getting notified through reopen cycles. They auto-remove on `archived` (the irreversible end state). On boards that never archive, a GC sweep purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days (default 30; set 0 to disable), so stale rows don't accumulate forever. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
 
+Delivery failures never delete a subscription. Hermes retries a bounded number
+of times, preserves the first failed event cursor, and then quarantines the
+destination so a permanent error cannot replay earlier successes forever.
+`notify-list --json` exposes the failure count, last error, and quarantine time.
+After fixing the target, run `notify-subscribe` again with the same routing
+tuple; this clears quarantine and retries only the undelivered suffix.
+
 A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
 
 ### Output truncation in messaging
@@ -1142,6 +1224,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `progress` | `{summary}` | The active worker called `kanban_progress` with a concise run-bound semantic milestone. The receipt also refreshes the claim; watchdogs may use it as useful-progress evidence. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |

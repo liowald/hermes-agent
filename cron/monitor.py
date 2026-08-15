@@ -9,7 +9,8 @@ hash stored from the last agent-triggering tick:
   the tick is recorded as a silent ``no_change`` run.
 * changed (or first run) → a "MONITOR CHANGE DETECTED" context block —
   unified diff of old vs new output (capped) plus the new output — is
-  injected into the prompt and the agent runs normally.
+  injected into the prompt and the agent runs normally. The new baseline is
+  committed only after that run and its requested delivery succeed.
 * source failure → treated as an ERROR, never as a change. The stored hash
   is left untouched so a source that recovers to its previous output still
   suppresses.
@@ -34,6 +35,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -60,6 +62,8 @@ class MonitorOutcome:
     first_run: bool = False
     context_block: Optional[str] = None
     error: Optional[str] = None
+    output_hash: Optional[str] = None
+    output: Optional[str] = None
 
 
 def hash_monitor_output(output: str) -> str:
@@ -99,13 +103,23 @@ def _read_last_output(job_id: str) -> str:
     return ""
 
 
-def _write_last_output(job_id: str, output: str) -> None:
+def _write_last_output(job_id: str, output: str) -> bool:
+    tmp = None
     try:
         path = _snapshot_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(output, encoding="utf-8")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(output, encoding="utf-8")
+        tmp.replace(path)
+        return True
     except Exception as exc:
         logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
 
 
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
@@ -147,10 +161,9 @@ def job_has_monitor(job: dict) -> bool:
 def check_monitor(job: dict) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
-    On change (or first run) the new hash + snapshot are persisted BEFORE
-    the agent runs — detection time is the state boundary, so a failed
-    agent run doesn't re-alert on the same content forever.
-    On failure nothing is persisted.
+    Detection is read-only. The scheduler commits a changed observation only
+    after the agent run and its requested delivery succeed, so an outage does
+    not silently consume the only alert for a durable anomaly.
     """
     job_id = str(job.get("id") or "")
     ok, output = _run_monitor_source(job)
@@ -188,16 +201,37 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Current output\n\n```\n{shown_output}\n```"
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
     return MonitorOutcome(
-        ok=True, changed=True, first_run=first_run, context_block=context_block
+        ok=True,
+        changed=True,
+        first_run=first_run,
+        context_block=context_block,
+        output_hash=new_hash,
+        output=output,
     )
 
 
-def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
+def persist_monitor_outcome(job_id: str, outcome: MonitorOutcome) -> bool:
+    """Commit a successfully processed changed observation."""
+    if not outcome.ok or not outcome.changed or not outcome.output_hash:
+        return False
+    return _persist_monitor_state(job_id, outcome.output_hash, outcome.output or "")
+
+
+def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> bool:
     from cron.jobs import _hermes_now, update_job
 
-    _write_last_output(job_id, output)
+    path = _snapshot_path(job_id)
+    try:
+        prior_exists = path.exists()
+        prior_output = path.read_text(encoding="utf-8") if prior_exists else ""
+    except Exception as exc:
+        logger.warning(
+            "Monitor: failed to preserve prior output for %r: %s", job_id, exc,
+        )
+        return False
+    if not _write_last_output(job_id, output):
+        return False
     try:
         update_job(
             job_id,
@@ -208,5 +242,18 @@ def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
                 }
             },
         )
+        return True
     except Exception as exc:
         logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
+        if prior_exists:
+            _write_last_output(job_id, prior_output)
+        else:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                logger.warning(
+                    "Monitor: failed to roll back output for %r: %s",
+                    job_id,
+                    rollback_exc,
+                )
+        return False

@@ -895,6 +895,20 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            membership = kanban_db.factory_task_membership(conn, task_id)
+            if (
+                membership
+                and membership["role"] == "root"
+                and membership["state"] != "done"
+                and s != task.status
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"factory {membership['root_id']} owns the root lifecycle; "
+                        "use factory retry or reconcile"
+                    ),
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -934,7 +948,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                try:
+                    ok = kanban_db.archive_task(conn, task_id)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1023,6 +1040,21 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
             with kanban_db.write_txn(conn):
+                try:
+                    kanban_db.assert_factory_task_editable(
+                        conn,
+                        task_id,
+                        fields=(
+                            field
+                            for field, value in (
+                                ("title", payload.title),
+                                ("body", payload.body),
+                            )
+                            if value is not None
+                        ),
+                    )
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
                 sets, vals = [], []
                 if payload.title is not None:
                     if not payload.title.strip():
@@ -1064,7 +1096,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
+        try:
+            ok = kanban_db.delete_task(conn, task_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
@@ -1133,6 +1168,7 @@ def _set_status_direct(
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
+        kanban_db.assert_factory_root_lifecycle(conn, task_id)
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id, worker_pid, claim_lock "
@@ -1340,6 +1376,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    try:
+                        kanban_db.assert_factory_root_lifecycle(conn, tid)
+                    except RuntimeError as exc:
+                        entry.update(ok=False, error=str(exc))
+                        results.append(entry)
+                        continue
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
