@@ -93,14 +93,15 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
-    """Build platform-aware thread metadata for adapter sends.
+    """Build platform-aware routing metadata for adapter sends.
 
     Most platforms route threaded sends with a generic ``thread_id`` metadata
     value. Telegram private-chat topics created through Hermes' DM-topic helper
     are exposed in updates as ``message_thread_id`` plus a reply anchor. Live
     user-message replies route with ``message_thread_id`` + ``reply_to_message_id``;
     synthetic/resumed sends that have no reply anchor fall back to Telegram's
-    ``direct_messages_topic_id`` when the Bot API supports it.
+    ``direct_messages_topic_id`` when the Bot API supports it. Buzz DM replies
+    carry the trusted inbound sender pubkey so the adapter can emit a p tag.
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
@@ -112,6 +113,14 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if (
+        _platform_name(getattr(source, "platform", None)) == "buzz"
+        and getattr(source, "chat_type", None) == "dm"
+    ):
+        recipient_pubkey = getattr(source, "user_id", None)
+        if recipient_pubkey:
+            # Never infer this trusted routing identity from message text.
+            metadata["buzz_recipient_pubkey"] = str(recipient_pubkey)
     if not metadata:
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":

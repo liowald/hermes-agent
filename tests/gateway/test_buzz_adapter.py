@@ -6,6 +6,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from gateway.platforms.base import _thread_metadata_for_source
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
@@ -24,6 +25,9 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_thread_refs = _buzz_mod._thread_refs
+_parse_buzz_target = _buzz_mod._parse_buzz_target
+_validate_buzz_target = _buzz_mod._validate_buzz_target
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -99,6 +103,27 @@ class _ScriptedCli:
         if queue:
             return queue[0]
         return 0, "[]", ""
+
+
+def test_explicit_uuid_target_parses_without_directory_discovery():
+    assert _parse_buzz_target(f" {CHANNEL.upper()} ") == (CHANNEL, None)
+    assert _validate_buzz_target(CHANNEL) is True
+    assert _parse_buzz_target("general") is None
+    assert _validate_buzz_target("general") == "expected a channel UUID"
+
+
+def test_thread_refs_support_marked_and_legacy_reply_tags():
+    assert _thread_refs([
+        ["e", "root", "", "root"],
+        ["e", "parent", "", "reply"],
+    ]) == ("root", "parent")
+    assert _thread_refs([["e", "legacy-parent"]]) == (
+        "legacy-parent", "legacy-parent"
+    )
+    assert _thread_refs([
+        ["e", "legacy-root"],
+        ["e", "legacy-parent"],
+    ]) == ("legacy-root", "legacy-parent")
 
 
 # ── bech32 / identity helpers ─────────────────────────────────────────────
@@ -207,6 +232,35 @@ class TestPollingDedupe:
         # Poll 2: identical response — the seen-id set must de-dupe
         await adapter._poll_channel(CHANNEL)
         assert len(adapter._dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_reply_preserves_marked_work_root_in_source():
+    adapter = _make_adapter()
+    adapter._message_handler = AsyncMock()
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    adapter._channel_state[CHANNEL] = {
+        "chat_type": "group", "last_ts": 0, "seen": {}
+    }
+    event = _event("reply-event", content="@Chip continue this", created_at=200)
+    event["tags"] = [
+        ["h", CHANNEL],
+        ["e", "root-event", "", "root"],
+        ["e", "parent-event", "", "reply"],
+    ]
+
+    await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+    assert len(captured) == 1
+    source = captured[0].source
+    assert source.thread_id == "root-event"
+    assert source.parent_chat_id == CHANNEL
+    assert source.message_id == "reply-event"
 
 
 # ── Mention gating / DMs / authorization ──────────────────────────────────
@@ -386,6 +440,51 @@ class TestDmClassification:
 
 class TestBuzzAdapterSend:
 
+    def test_dm_recipient_metadata_uses_trusted_source_identity(self):
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        source = adapter.build_source(
+            chat_id=DM_CHANNEL,
+            chat_type="dm",
+            user_id=OTHER_PUBKEY,
+        )
+        expected = {"buzz_recipient_pubkey": OTHER_PUBKEY}
+
+        assert _thread_metadata_for_source(source, "human-event") == expected
+        runner = object.__new__(GatewayRunner)
+        assert runner._thread_metadata_for_source(source, "human-event") == expected
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_mentions_trusted_sender_pubkey(self):
+        adapter = _make_adapter()
+        adapter._channel_state[DM_CHANNEL] = {
+            "chat_type": "dm", "last_ts": 0, "seen": {}
+        }
+        source = adapter.build_source(
+            chat_id=DM_CHANNEL,
+            chat_type="dm",
+            user_id=OTHER_PUBKEY,
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send",
+            {"accepted": True, "event_id": "evt-dm-reply", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            DM_CHANNEL,
+            "reply",
+            reply_to="human-event",
+            metadata=_thread_metadata_for_source(source, "human-event"),
+        )
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "human-event"
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+
     @pytest.mark.asyncio
     async def test_send_success_via_stdin(self):
         adapter = _make_adapter()
@@ -404,6 +503,8 @@ class TestBuzzAdapterSend:
         # Content travels via stdin (--content -), never argv
         assert args[args.index("--content") + 1] == "-"
         assert stdin_text == "hello **markdown**"
+        assert "--reply-to" not in args
+        assert "--mention" not in args
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
@@ -416,10 +517,18 @@ class TestBuzzAdapterSend:
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt126", "message": ""})
         adapter._run_cli = cli
-        result = await adapter.send_image(CHANNEL, str(img), caption="screenshot")
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="screenshot",
+            reply_to="human-event",
+            metadata={"buzz_recipient_pubkey": OTHER_PUBKEY},
+        )
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+        assert args[args.index("--reply-to") + 1] == "human-event"
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -503,6 +612,8 @@ class TestBuzzPluginRegistration:
         kwargs = ctx.register_platform.call_args.kwargs
         assert kwargs["name"] == "buzz"
         assert kwargs["cron_deliver_env_var"] == "BUZZ_HOME_CHANNEL"
+        assert kwargs["parse_target_ref_fn"] is _parse_buzz_target
+        assert kwargs["validate_target_ref_fn"] is _validate_buzz_target
         assert kwargs["allowed_users_env"] == "BUZZ_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "BUZZ_ALLOW_ALL_USERS"
         assert callable(kwargs["standalone_sender_fn"])
@@ -536,5 +647,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-

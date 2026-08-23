@@ -23860,7 +23860,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source,
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Build the metadata dict platforms need for thread-aware replies."""
+        """Build metadata platforms need for thread- and recipient-aware replies."""
         metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
@@ -23890,6 +23890,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        if (
+            getattr(getattr(source, "platform", None), "value", None) == "buzz"
+            and getattr(source, "chat_type", None) == "dm"
+        ):
+            recipient_pubkey = getattr(source, "user_id", None)
+            if recipient_pubkey:
+                metadata = dict(metadata or {})
+                metadata["buzz_recipient_pubkey"] = str(recipient_pubkey)
         return metadata
 
     def _thread_metadata_for_target(

@@ -112,6 +112,36 @@ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
 
 
+def _thread_refs(tags: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Return canonical Nostr root/reply event ids from Buzz message tags."""
+    root = None
+    parent = None
+    unmarked: List[str] = []
+    if not isinstance(tags, list):
+        return root, parent
+    for tag in tags:
+        if not isinstance(tag, list) or len(tag) < 2 or tag[0] != "e":
+            continue
+        event_id = str(tag[1] or "").strip()
+        if not event_id:
+            continue
+        marker = str(tag[3] or "").strip().lower() if len(tag) > 3 else ""
+        if marker == "root":
+            root = event_id
+        elif marker == "reply":
+            parent = event_id
+        elif not marker:
+            unmarked.append(event_id)
+    if unmarked:
+        if root is None:
+            root = unmarked[0]
+        if parent is None:
+            parent = unmarked[-1]
+    if root is None and parent is not None:
+        root = parent
+    return root, parent
+
+
 def _load_nostr_auth():
     """Import the sibling nostr_auth module in a loader-agnostic way.
 
@@ -612,6 +642,12 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+            recipient_pubkey = _normalize_user_ref(
+                str((metadata or {}).get("buzz_recipient_pubkey") or "")
+            )
+            if recipient_pubkey:
+                # buzz-cli materializes explicit mentions as Nostr p tags.
+                args += ["--mention", recipient_pubkey]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -681,8 +717,14 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            reply_target = reply_to or (metadata or {}).get("thread_id")
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
+                recipient_pubkey = _normalize_user_ref(
+                    str((metadata or {}).get("buzz_recipient_pubkey") or "")
+                )
+                if recipient_pubkey:
+                    args += ["--mention", recipient_pubkey]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1048,6 +1090,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        root_event_id, _reply_parent_id = _thread_refs(event.get("tags"))
+        work_thread_id = None if is_dm else (root_event_id or event_id)
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1056,6 +1101,8 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=work_thread_id,
+            parent_chat_id=channel_id if work_thread_id else None,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1219,6 +1266,8 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1279,9 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
         )
 
         event = MessageEvent(
@@ -1484,6 +1536,23 @@ def interactive_setup() -> None:
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
+_BUZZ_CHANNEL_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+
+def _parse_buzz_target(target_ref: str) -> Optional[tuple[str, Optional[str]]]:
+    value = str(target_ref or "").strip()
+    if _BUZZ_CHANNEL_RE.fullmatch(value):
+        return value.lower(), None
+    return None
+
+
+def _validate_buzz_target(target_ref: str) -> bool | str:
+    return True if _parse_buzz_target(target_ref) is not None else "expected a channel UUID"
+
+
 def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1506,6 +1575,10 @@ def register(ctx):
         apply_yaml_config_fn=_apply_yaml_config,
         # Cron home-channel delivery support (deliver=buzz).
         cron_deliver_env_var="BUZZ_HOME_CHANNEL",
+        # Accept an explicit channel UUID before async discovery populates the
+        # channel directory (notably for cron and direct send targets).
+        parse_target_ref_fn=_parse_buzz_target,
+        validate_target_ref_fn=_validate_buzz_target,
         # Out-of-process cron delivery.  Without this hook, deliver=buzz
         # cron jobs fail with "No live adapter" when cron runs separately
         # from the gateway.
