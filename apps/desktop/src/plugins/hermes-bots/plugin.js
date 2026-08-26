@@ -90,6 +90,11 @@ const ID = 'hermes-bots'
  *  opens and, on its rising edge, yields the center to the chat. */
 const BOTS_HOME_PANE_ID = `plugin-workspace:${ID}:home`
 const ROSTER_KEY = [ID, 'roster']
+// Bounded retries. `retry: true` keeps React Query in isLoading until the
+// first success, so a stalled profiles.list (live state.db write lock, SSH
+// flap) leaves the Bots sidebar on a spinner with no error card. The 5s
+// refetchInterval and the gateway-open effect already recover drops.
+const ROSTER_QUERY_RETRY = 2
 const ROUTINES_KEY = [ID, 'routines']
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 const BOT_META_V1_KEY = 'bot-meta'
@@ -402,7 +407,6 @@ function fallbackFocusedBotOwner(profile = $focusedBotProfile.get?.()) {
   }
 }
 
-const hasFocusedSessionOwnerSupport = Boolean(host.state.focusedSessionOwner)
 const $focusedBotOwner = host.state.focusedSessionOwner || {
   get: () => fallbackFocusedBotOwner(),
   listen: listener => {
@@ -4650,9 +4654,7 @@ function useRoster() {
     },
     refetchInterval: 5000,
     staleTime: 5000,
-    // Remote (SSH) gateways connect slowly and drop on sleep/wake; keep
-    // retrying instead of latching a terminal error card.
-    retry: true,
+    retry: ROSTER_QUERY_RETRY,
     retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
   })
 }
@@ -5309,10 +5311,55 @@ async function requestForBot(bot, method, params = {}) {
       throw new Error(`Cannot route ${method} for ${route.connectionId}::${route.profile}`)
     }
 
-    return host.requestProfile(route, method, scopedBotParams(route, method, params))
+    try {
+      return await host.requestProfile(route, method, scopedBotParams(route, method, params))
+    } catch (error) {
+      // React 19 formats query errors with `(error.name || '').trim()`. IPC /
+      // JSON-RPC rejections are often plain objects whose `name` is a number,
+      // which crashes the Routines pane and hides the original failure (#94471).
+      throw asRpcError(error, `Gateway request ${method} failed`)
+    }
   }
 
-  return host.request(method, params)
+  try {
+    return await host.request(method, params)
+  } catch (error) {
+    throw asRpcError(error, `Gateway request ${method} failed`)
+  }
+}
+
+/** Coerce an IPC/JSON-RPC rejection into an Error with a string `name`.
+ *
+ *  React Query stores whatever the queryFn throws. React 19 then formats it
+ *  with `(e.name || '').trim()`, which throws TypeError when `name` is a
+ *  number (JSON-RPC codes) or another non-string — the Routines pane crash
+ *  in #94471. Real Error instances are returned as-is when already safe.
+ */
+function asRpcError(value, fallback) {
+  // Duck-type across realms (plugin tests run the source in `vm`, and IPC
+  // can deliver Error-like objects whose prototype is not this realm's
+  // Error). React 19 only needs a string `name`. Never mutate the rejection:
+  // frozen/sealed objects make `name = 'Error'` a silent no-op in sloppy
+  // mode, so a non-string name always becomes a fresh Error with cause.
+  const isObject = value != null && typeof value === 'object'
+  const name = isObject ? value.name : undefined
+  const message = isObject ? value.message : undefined
+  const hasStringName = typeof name === 'string'
+  const hasStringMessage = typeof message === 'string'
+  const hasStack = isObject && typeof value.stack === 'string'
+
+  if (isObject && hasStringName && (hasStack || hasStringMessage)) {
+    return value
+  }
+
+  if (isObject) {
+    const text = hasStringMessage && String(message).trim() ? String(message) : fallback
+    const error = new Error(text)
+    error.cause = value
+    return error
+  }
+
+  return new Error(value == null || value === '' ? fallback : String(value))
 }
 
 /** Stable per-member identity inside a group room. Local members keep their
@@ -11207,7 +11254,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               'Send results to',
               pickerSelect(target, setTarget, [
                 { id: 'history', label: 'Run history only' },
-                { id: 'bot-chat', label: `${displayName({ name: bot }, $botMeta.get()[bot])}\u2019s chat (bot responds)` }
+                { id: 'bot-chat', label: `${displayName(typeof bot === 'string' ? { name: bot } : bot, botRosterMeta(bot, $botMeta.get()))}\u2019s chat (bot responds)` }
               ])
             ),
             jsxs('label', {
@@ -11280,29 +11327,38 @@ function bindProfileSync(ownerStore) {
 }
 
 function resolveRoutineOwner(roster, focusedOwner, selected) {
-  if (hasFocusedSessionOwnerSupport && !focusedOwner) {
-    return null
-  }
-
+  // A null focused owner is NOT a failure: the SDK fails closed to null
+  // whenever the focused session has no unique bot owner (a normal chat,
+  // ambiguous owner hints) — the common case while the user browses the
+  // Bots pane. Fall through to the roster-clicked bot (the previously
+  // working scope) instead of dead-ending the pane on the unavailable
+  // placeholder for every agent (#94516).
+  const selectedBot = roster.find(bot => botSelectionKey(bot) === selected)
   const focusedBot = focusedOwner
     ? roster.find(bot => isActiveRosterBot(bot, focusedOwner))
     : null
 
   if (focusedOwner?.authoritative) {
+    // An authoritative focused owner wins, but only through its exact roster
+    // row. If that row is absent, fail closed instead of routing cron
+    // reads/mutations through a stale selection or an unscoped profile name.
     return focusedBot || null
   }
 
-  const selectedBot = roster.find(bot => botSelectionKey(bot) === selected)
   return focusedBot || selectedBot || (focusedOwner ? { name: focusedOwner.name } : null)
 }
 
 function RoutinesPane() {
   const selected = useValue($selectedBot)
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
-  // A complete focused owner is authoritative. If its exact roster row is
-  // absent, fail closed instead of routing cron reads/mutations through a
+  // Subscribe instead of a bare read: BotsHomeView owns the roster fetch and
+  // can hydrate (or replace) rows after this pane mounted, so a .get()
+  // snapshot captured while the roster was still empty pinned the pane on
+  // "unavailable" until some unrelated atom happened to re-render it (#94483).
+  // A complete focused owner is still authoritative. If its exact roster row
+  // is absent, fail closed rather than routing cron reads/mutations through a
   // stale selection or an unscoped profile name.
-  const owner = resolveRoutineOwner($lastRoster.get(), focusedOwner, selected)
+  const owner = resolveRoutineOwner(useValue($lastRoster), focusedOwner, selected)
   const bot = String(owner?.name || focusedOwner?.name || 'default').trim() || 'default'
   const allMeta = useValue($botMeta)
   const meta = owner ? botRosterMeta(owner, allMeta) : null

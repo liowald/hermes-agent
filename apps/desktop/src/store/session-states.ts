@@ -38,6 +38,7 @@ import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
 import {
   $activeSessionId,
+  $connection,
   $lastReadAtBySessionId,
   $selectedStoredSessionId,
   $sessions,
@@ -51,7 +52,7 @@ import {
 } from './session'
 import { requestForSessionProfile, type SessionOwnerScope, type SessionProfileRoute } from './session-request-router'
 import { ackStoredSessionId, markSessionUnreadFinished } from './session-unread'
-import { isSecondaryWindow } from './windows'
+import { isBrowserWindow, isSecondaryWindow } from './windows'
 
 // ---------------------------------------------------------------------------
 // Reactive per-runtime session state (view mirror of the wiring cache).
@@ -687,13 +688,15 @@ const profileKey = () => normalizeProfileKey($activeGatewayProfile.get())
 // A secondary window (single-chat pop-out) shows ONLY its routed session — no
 // tiles, and no repopulation on a profile switch.
 export const $sessionTiles = atom<SessionTile[]>(
-  isSecondaryWindow() ? [] : [...(tilesByProfile[profileKey()] ?? []), ...(tilesByProfile[BOTS_TILE_BUCKET] ?? [])]
+  isSecondaryWindow() || isBrowserWindow()
+    ? []
+    : [...(tilesByProfile[profileKey()] ?? []), ...(tilesByProfile[BOTS_TILE_BUCKET] ?? [])]
 )
 
 function persistTiles() {
-  // Shares the origin's storage; a secondary window holds no tiles, so a write
-  // back would only wipe the primary's set.
-  if (isSecondaryWindow()) {
+  // Shares the origin's storage; a secondary / browser pop-out holds no tiles,
+  // so a write back would only wipe the primary's set.
+  if (isSecondaryWindow() || isBrowserWindow()) {
     return
   }
 
@@ -725,7 +728,7 @@ function saveTiles(tiles: SessionTile[]) {
 // they re-resume against the now-current gateway. (Fires immediately on
 // subscribe; harmless — the init value already matches.) A secondary window
 // never carries tiles, so it stays out of this entirely.
-if (!isSecondaryWindow()) {
+if (!isSecondaryWindow() && !isBrowserWindow()) {
   $activeGatewayProfile.subscribe(() => {
     $sessionTiles.set([...(tilesByProfile[profileKey()] ?? []), ...(tilesByProfile[BOTS_TILE_BUCKET] ?? [])])
   })
@@ -753,6 +756,27 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
   return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
+}
+
+/**
+ * Whether the connection that OWNS `sessionId` is remote — never the ambient
+ * `$connection`. A session tied to a registered secondary connection (Bot
+ * Mode, the unified Sessions list) can differ from whichever connection the
+ * window currently shows; its RPCs already route to their own owner via
+ * `requestForSessionProfile`, but a caller that instead reads ambient mode to
+ * decide image.attach vs image.attach_bytes ships a client-local path to a
+ * remote backend that can't resolve it (#94640). A bare profile name (no
+ * connectionId) is a pool profile of the ambient connection, so ambient mode
+ * still applies there.
+ */
+export function isSessionRemote(sessionId: null | string | undefined): boolean {
+  const owner = knownOwnerForSession(sessionId)
+
+  if (owner && typeof owner === 'object' && owner.mode) {
+    return owner.mode === 'remote'
+  }
+
+  return $connection.get()?.mode === 'remote'
 }
 
 /**
