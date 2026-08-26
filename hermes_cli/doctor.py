@@ -414,7 +414,12 @@ STATE_DB_SIZE_WARN_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB logical size
 from hermes_cli.sizefmt import format_bytes as _human_bytes
 
 
-def _render_state_db_stats(stats: dict, holders=None) -> list:
+def _render_state_db_stats(
+    stats: dict,
+    holders=None,
+    *,
+    auto_prune_enabled: bool = False,
+) -> list:
     """Turn a collect_state_db_stats() dict into doctor output lines.
 
     Returns a list of ``(kind, text, detail)`` tuples where kind is one of
@@ -479,8 +484,9 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
     # optimize-storage pass that migrates/compacts the FTS indexes.
     if logical is not None and logical > STATE_DB_SIZE_WARN_BYTES:
         detail = (
-            "consider enabling sessions.auto_prune in config.yaml "
-            "to bound growth"
+            "sessions.auto_prune is enabled"
+            if auto_prune_enabled
+            else "consider enabling sessions.auto_prune in config.yaml to bound growth"
         )
         legacy_trigram = (
             fts is not None
@@ -2167,14 +2173,23 @@ def run_doctor(args):
         try:
             from hermes_state import collect_state_db_stats, count_db_holders
 
+            from hermes_cli.config import load_config as _load_doctor_config
+
             _db_stats = collect_state_db_stats(state_db_path)
             _db_holders = count_db_holders(state_db_path)
+            _sessions_config = (_load_doctor_config() or {}).get("sessions") or {}
+            _auto_prune_enabled = (
+                isinstance(_sessions_config, dict)
+                and _sessions_config.get("auto_prune") is True
+            )
             for _kind, _text, _detail in _render_state_db_stats(
-                _db_stats, holders=_db_holders
+                _db_stats,
+                holders=_db_holders,
+                auto_prune_enabled=_auto_prune_enabled,
             ):
                 if _kind == "warn":
                     check_warn(_text, _detail)
-                    if "auto_prune" in _detail:
+                    if "consider enabling sessions.auto_prune" in _detail:
                         issues.append(
                             "state.db is large — enable sessions.auto_prune "
                             "in config.yaml"
@@ -2183,6 +2198,11 @@ def run_doctor(args):
                                 "offline (gateway stopped)"
                                 if "optimize-storage" in _detail else ""
                             )
+                        )
+                    elif "optimize-storage" in _detail:
+                        issues.append(
+                            "state.db is large — run 'hermes sessions "
+                            "optimize-storage' offline (gateway stopped)"
                         )
                 else:
                     check_info(_text + (f" {_detail}" if _detail else ""))
