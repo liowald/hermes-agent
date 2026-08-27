@@ -361,6 +361,15 @@ class TestDeleteProfile:
         with pytest.raises(RuntimeError, match="being deleted"):
             create_profile("coder", no_alias=True)
 
+    def test_profile_resolution_rejects_active_delete_before_directory_removal(
+        self, profile_env
+    ):
+        profile_dir = create_profile("coder", no_alias=True)
+
+        with profiles._hold_profile_deletion_marker(profile_dir):
+            with pytest.raises(FileNotFoundError, match="being deleted or was deleted"):
+                resolve_profile_env("coder")
+
 
     def test_backend_scan_only_matches_this_profile(self, profile_env, monkeypatch):
         """The backend PID scan binds by --profile selector and skips self."""

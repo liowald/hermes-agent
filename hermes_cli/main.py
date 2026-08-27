@@ -564,7 +564,9 @@ def _apply_profile_override() -> None:
 
         candidate = home / ".hermes" / "profiles" / name
         try:
-            if candidate.is_dir():
+            from hermes_constants import profile_deletion_blocks_start
+
+            if candidate.is_dir() and not profile_deletion_blocks_start(candidate):
                 return str(candidate)
         except OSError:
             return None
@@ -628,7 +630,21 @@ def _apply_profile_override() -> None:
     # See issue #22502.
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
-        if Path(hermes_home_env).parent.name == "profiles":
+        inherited_profile_home = Path(hermes_home_env)
+        if inherited_profile_home.parent.name == "profiles":
+            # Desktop and other launchers inherit HERMES_HOME into profile
+            # children.  A CLI deletion can publish its cross-process lease
+            # after the launcher preflight but before the child reaches this
+            # entry point, so the child itself is the authoritative final
+            # boundary.  Check before importing modules that may create state.
+            from hermes_constants import profile_deletion_blocks_start
+
+            if profile_deletion_blocks_start(inherited_profile_home):
+                print(
+                    f"Error: Profile '{inherited_profile_home.name}' is being deleted or was deleted.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             return
 
     # 2. If no flag, check active_profile in the hermes root.

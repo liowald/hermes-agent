@@ -112,6 +112,22 @@ def _resolved_home() -> str:
     return os.path.join(os.path.expanduser("~"), ".hermes")
 
 
+def profile_deletion_may_block_fast_start() -> bool:
+    """Cheap marker probe before the profile-aware import boundary.
+
+    The fast ``--version`` path normally exits before ``main`` applies profile
+    routing.  When a launcher inherited a named profile home, that shortcut
+    must fall back to the normal path while deletion state exists; otherwise
+    update-status caching can recreate files under a deleted profile.
+    """
+    home = os.path.normpath(_resolved_home())
+    parent = os.path.dirname(home)
+    if os.path.basename(parent) != "profiles":
+        return False
+    marker = os.path.join(parent, f".deleting-{os.path.basename(home)}")
+    return os.path.exists(marker)
+
+
 def container_mode_may_be_active() -> bool:
     """Conservative probe for NixOS container-mode routing.
 
@@ -267,6 +283,8 @@ def try_fast_version(argv: list[str] | None = None) -> bool:
         if not is_termux_fast_version_argv(argv):
             return False
     elif not is_global_fast_version_argv(argv):
+        return False
+    elif profile_deletion_may_block_fast_start():
         return False
     elif container_mode_may_be_active():
         return False

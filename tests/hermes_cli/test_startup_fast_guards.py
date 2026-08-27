@@ -85,6 +85,22 @@ def test_fast_version_parity_off_termux(tmp_path):
         assert field in out, f"fast --version output missing {field!r}:\n{out}"
 
 
+def test_inherited_deleted_profile_version_takes_guarded_startup_path(tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    marker = profile.parent / ".deleting-coder"
+    marker.write_text("deleted", encoding="utf-8")
+
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+    result = _run_version({"HERMES_HOME": str(profile), "TERMUX_VERSION": ""})
+    after = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+    assert result.returncode == 1
+    assert "being deleted or was deleted" in result.stderr
+    assert after == before
+
+
 def test_fast_version_parity_on_termux(tmp_path):
     """The historical Termux path — the one eb4040242 broke."""
     home = tmp_path / ".hermes"

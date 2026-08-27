@@ -2609,6 +2609,16 @@ def resolve_profile_env(profile_name: str) -> str:
         return str(root)
     profile_dir = root / "profiles" / canon
 
+    # This is the explicit ``--profile`` startup boundary.  The directory can
+    # still exist while another process holds the deletion lease, and a stale
+    # launcher may have recreated a skeleton after a completed delete.  Refuse
+    # both states before callers install this path as HERMES_HOME.
+    if profile_deletion_blocks_start(profile_dir):
+        raise FileNotFoundError(
+            f"Profile '{canon}' is being deleted or was deleted. "
+            f"Create it explicitly before using it."
+        )
+
     if not profile_dir.is_dir():
         raise FileNotFoundError(
             f"Profile '{canon}' does not exist. "
