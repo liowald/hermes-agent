@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+from decimal import Decimal, InvalidOperation
 from hermes_cli.cli_output import line_input
 import json
 import logging
@@ -215,7 +216,32 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # NOT a HERMES_* blanket: integration credentials (HERMES_GEMINI_*,
     # HERMES_LANGFUSE_*, HERMES_SPOTIFY_*, ...) ARE allowed.
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
+    "HERMES_CONFIG_PATH", "HERMES_ENV_PATH",
+    # MCP catalog trust root. Package-manager wrappers may still provide this
+    # in the process environment; only generic persistence writes are blocked.
+    "HERMES_OPTIONAL_MCPS",
+    # Local ACP subprocess selection. Existing operator/package-manager values
+    # remain readable; generic writers cannot acquire executable/argv authority.
+    "HERMES_COPILOT_ACP_COMMAND", "HERMES_COPILOT_ACP_ARGS",
+    # Hermes security policy / approval-routing context. These remain available
+    # through their dedicated CLI/config/session controls, but a generic
+    # credential writer must not persist them for the next process startup.
+    "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS",
+    "HERMES_INTERACTIVE", "HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION",
+    "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION",
+    "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM",
 })
+
+
+def _env_var_policy_name(key: str, *, is_windows: Optional[bool] = None) -> str:
+    """Return the name used for environment policy comparisons.
+
+    Windows environment names are case-insensitive; POSIX names are not. The
+    explicit override keeps both semantics directly testable without pretending
+    the test interpreter is running on another host OS.
+    """
+    windows = _IS_WINDOWS if is_windows is None else is_windows
+    return key.upper() if windows else key
 
 
 def _reject_denylisted_env_var(key: str) -> None:
@@ -224,15 +250,27 @@ def _reject_denylisted_env_var(key: str) -> None:
     Centralised so both the regular and "secure" env writers share the
     same gate, and so the message is consistent for callers.
     """
-    if key in _ENV_VAR_NAME_DENYLIST:
+    if _env_var_policy_name(key) in _ENV_VAR_NAME_DENYLIST:
         raise ValueError(
             f"Environment variable {key!r} is on the writer denylist. "
             "Names that influence subprocess execution (LD_PRELOAD, "
             "PYTHONPATH, PATH, EDITOR, ...) or Hermes runtime location "
-            "(HERMES_HOME, HERMES_PROFILE, ...) cannot be persisted via "
+            "and security policy (HERMES_HOME, HERMES_YOLO_MODE, ...) "
+            "cannot be persisted via "
             "the env writer. If you really need this, edit "
             "~/.hermes/.env directly."
         )
+
+
+def validate_env_var_name_for_write(key: str) -> None:
+    """Validate an environment name before a generic persistence write.
+
+    Exposed separately from :func:`save_env_value` so batch-style callers can
+    validate their complete request before writing the first value.
+    """
+    if not _ENV_VAR_NAME_RE.match(key):
+        raise ValueError(f"Invalid environment variable name: {key!r}")
+    _reject_denylisted_env_var(key)
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
@@ -4211,7 +4249,12 @@ def _quote_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _env_line_defines_key(line: str, key: str) -> bool:
+def _env_line_defines_key(
+    line: str,
+    key: str,
+    *,
+    is_windows: Optional[bool] = None,
+) -> bool:
     """True when a .env line assigns ``key`` — plain or ``export``-prefixed.
 
     ``load_env()`` accepts the bash-compatible ``export KEY=value`` form
@@ -4222,7 +4265,13 @@ def _env_line_defines_key(line: str, key: str) -> bool:
     stripped = line.strip()
     if stripped.startswith("export "):
         stripped = stripped[7:].lstrip()
-    return stripped.startswith(f"{key}=")
+    assigned_key, separator, _value = stripped.partition("=")
+    if not separator:
+        return False
+    return _env_var_policy_name(
+        assigned_key,
+        is_windows=is_windows,
+    ) == _env_var_policy_name(key, is_windows=is_windows)
 
 
 def save_env_value(key: str, value: str):
@@ -4243,9 +4292,7 @@ def save_env_value(key: str, value: str):
             file=sys.stderr,
         )
         return
-    if not _ENV_VAR_NAME_RE.match(key):
-        raise ValueError(f"Invalid environment variable name: {key!r}")
-    _reject_denylisted_env_var(key)
+    validate_env_var_name_for_write(key)
     value = value.replace("\n", "").replace("\r", "")
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
@@ -5388,7 +5435,12 @@ def _coerce_int(value: str):
 
 
 def _coerce_float(value: str):
-    """Return float(value) for a clean float literal, else None."""
+    """Return ``float(value)`` when conversion preserves its decimal value.
+
+    Decimal-looking identifiers can be much more precise than a binary float.
+    Silently rounding one here corrupts it before it reaches ``config.yaml``,
+    so values that do not round-trip through ``float`` remain strings.
+    """
     try:
         f = float(value)
     except (TypeError, ValueError):
@@ -5396,6 +5448,11 @@ def _coerce_float(value: str):
     # Reject NaN/inf spellings — they are almost never intended config values
     # and round-trip confusingly through YAML.
     if f != f or f in (float("inf"), float("-inf")):
+        return None
+    try:
+        if Decimal(value) != Decimal(str(f)):
+            return None
+    except InvalidOperation:
         return None
     return f
 

@@ -1013,6 +1013,24 @@ export const zh: Translations = {
       cancel: '取消',
       empty: '尚未注册任何连接。'
     },
+    managedUpdates: {
+      title: '托管更新',
+      intro:
+        '以事务方式更新由桌面端托管的 SSH 安装：先排空会话，再更新远端检出，最后恢复每个 profile，并生成关联回执。',
+      sshConnection: '桌面端托管的 SSH 安装',
+      update: '更新',
+      updating: '更新中…',
+      progress: '正在排空会话、更新远端安装并恢复 profile…',
+      updated: '已更新',
+      partial: '已更新 — 恢复失败',
+      refused: '已拒绝',
+      failed: '更新失败',
+      alreadyRunning: '更新已在进行中',
+      receipt: (id: string, outcome: string) => `回执 ${id} · ${outcome}`,
+      receiptVersions: (pre: string, post: string) => `${pre} → ${post}`,
+      scopesRestored: (profiles: string) => `已恢复的 profile：${profiles}`,
+      scopeNotRestored: (profile: string, error: string) => `Profile“${profile}”未恢复：${error}`
+    },
     gateway: {
       loading: '正在加载网关设置...',
       unavailableTitle: '网关设置不可用',
@@ -2126,7 +2144,11 @@ export const zh: Translations = {
       message: count => `在您检查模型设置之前，${count} 个定时任务将被跳过。`,
       detailMore: (names, remaining) => `${names}，以及另外 ${remaining} 个`,
       review: '检查定时任务',
-      saveFailed: 'Hermes 未保存该模型更改。'
+      saveFailed: 'Hermes 未保存该模型更改。',
+      confirmTitle: '模型选择警告',
+      confirmDetail: '仅在你接受此权衡时确认。',
+      confirmAction: '确认',
+      declined: '已取消模型更改 — 你拒绝了数据训练层级警告。'
     },
     search: '搜索定时任务…',
     loading: '正在加载定时任务…',
