@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import yaml
 
+import hermes_constants
 from hermes_cli import profiles
 from hermes_cli.profiles import (
     normalize_profile_name,
@@ -283,8 +284,82 @@ class TestDeleteProfile:
                 delete_profile("coder", yes=True)
 
         assert profile_dir.is_dir()
+        assert not profiles.profile_deletion_marker_path(profile_dir).exists()
         assert get_active_profile() == "default"
 
+    def test_delete_leaves_durable_tombstone_after_profile_is_removed(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        marker = profiles.profile_deletion_marker_path(profile_dir)
+        observed = []
+
+        def stop_backends(canon, target):
+            observed.append((canon, target, marker.read_text(encoding="utf-8")))
+            assert marker.read_text(encoding="utf-8") == f"deleting:{os.getpid()}"
+
+        with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._stop_profile_backends", side_effect=stop_backends):
+            delete_profile("coder", yes=True)
+
+        assert observed == [("coder", profile_dir, f"deleting:{os.getpid()}")]
+        assert marker.read_text(encoding="utf-8") == "deleted"
+        assert not profile_dir.exists()
+
+        # A stale scheduler may recreate a harmless skeleton before it sees the
+        # tombstone. The deleted identity must remain absent from every profile
+        # discovery path.
+        (profile_dir / "cron").mkdir(parents=True)
+        assert "coder" not in {info.name for info in list_profiles()}
+        assert "coder" not in {name for name, _ in profiles_to_serve(True)}
+
+    def test_concurrent_delete_cannot_overwrite_or_release_active_lease(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        marker = profiles.profile_deletion_marker_path(profile_dir)
+
+        with profiles._hold_profile_deletion_marker(profile_dir):
+            expected = f"deleting:{os.getpid()}"
+            assert marker.read_text(encoding="utf-8") == expected
+            with pytest.raises(RuntimeError, match="already being deleted"):
+                with profiles._hold_profile_deletion_marker(profile_dir):
+                    pass
+            assert marker.read_text(encoding="utf-8") == expected
+
+        assert not marker.exists()
+
+    def test_create_clears_marker_left_by_dead_delete_owner(self, profile_env, monkeypatch):
+        profile_dir = get_profile_dir("coder")
+        marker = profiles.profile_deletion_marker_path(profile_dir)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("deleting:4242", encoding="utf-8")
+        monkeypatch.setattr(hermes_constants, "_profile_marker_owner_is_alive", lambda pid: False)
+
+        created = create_profile("coder", no_alias=True)
+
+        assert created == profile_dir
+        assert not marker.exists()
+
+    def test_create_consumes_completed_delete_tombstone(self, profile_env):
+        profile_dir = get_profile_dir("coder")
+        marker = profiles.profile_deletion_marker_path(profile_dir)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("deleted", encoding="utf-8")
+        (profile_dir / "cron").mkdir(parents=True)
+        (profile_dir / "cron" / "stale").write_text("stale", encoding="utf-8")
+
+        created = create_profile("coder", no_alias=True)
+
+        assert created == profile_dir
+        assert not (created / "cron" / "stale").exists()
+        assert not marker.exists()
+
+    def test_create_rejects_name_while_delete_owner_is_alive(self, profile_env, monkeypatch):
+        profile_dir = get_profile_dir("coder")
+        marker = profiles.profile_deletion_marker_path(profile_dir)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("deleting:4242", encoding="utf-8")
+        monkeypatch.setattr(hermes_constants, "_profile_marker_owner_is_alive", lambda pid: True)
+
+        with pytest.raises(RuntimeError, match="being deleted"):
+            create_profile("coder", no_alias=True)
 
 
     def test_backend_scan_only_matches_this_profile(self, profile_env, monkeypatch):

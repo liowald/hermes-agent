@@ -758,7 +758,11 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
+from hermes_constants import (  # noqa: F811,E402
+    get_hermes_home,
+    get_process_hermes_home,
+    profile_deletion_blocks_start,
+)
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -951,6 +955,16 @@ def ensure_hermes_home():
     """
     home = get_hermes_home()
     key = str(home)
+
+    # A deleted profile can be recreated as a one-directory skeleton by stale
+    # cron/profile-scoped callers before Desktop's backend-spawn guard runs.
+    # The lifecycle tombstone remains authoritative even when that skeleton
+    # exists, and must be checked before the memoized fast path.
+    if home.parent.name == "profiles" and profile_deletion_blocks_start(home):
+        raise FileNotFoundError(
+            f"Named profile home is deleted or being deleted: {home}. "
+            "Create the profile explicitly before using it."
+        )
 
     if key in _HERMES_HOME_ENSURED and home.is_dir():
         return

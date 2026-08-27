@@ -14,6 +14,7 @@ from pathlib import Path
 
 _profile_fallback_warned: bool = False
 _UNSET = object()
+PROFILE_DELETION_MARKER_PREFIX = ".deleting-"
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
@@ -48,6 +49,63 @@ def get_hermes_home_override() -> str | None:
     if override is _UNSET or not override:
         return None
     return str(override)
+
+
+def profile_deletion_marker_path(profile_home: str | Path) -> Path:
+    """Return the cross-process lifecycle marker for one named profile."""
+    home = Path(profile_home)
+    return home.parent / f"{PROFILE_DELETION_MARKER_PREFIX}{home.name}"
+
+
+def profile_deletion_marker_state(profile_home: str | Path) -> str | None:
+    """Read a profile lifecycle marker without creating any directories."""
+    marker = profile_deletion_marker_path(profile_home)
+    try:
+        return marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # The marker exists but is unreadable. Fail closed in callers.
+        return ""
+
+
+def profile_deletion_marker_owner(profile_home: str | Path) -> int | None:
+    """Return an active-delete owner PID, or ``None`` for other states."""
+    state = profile_deletion_marker_state(profile_home)
+    if state is None or state == "deleted":
+        return None
+    owner = state.removeprefix("deleting:") if state.startswith("deleting:") else state
+    try:
+        pid = int(owner)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _profile_marker_owner_is_alive(pid: int) -> bool:
+    """Cross-platform liveness check; uncertainty keeps the lease active."""
+    try:
+        import psutil  # type: ignore
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        # psutil is a core dependency. Fail closed if an unusual embedded
+        # runtime cannot import it; never use os.kill(pid, 0), which sends a
+        # real CTRL_C_EVENT on Windows (bpo-14484).
+        return True
+
+
+def profile_deletion_blocks_start(profile_home: str | Path) -> bool:
+    """Whether delete state makes a named profile unavailable to runtimes."""
+    state = profile_deletion_marker_state(profile_home)
+    if state is None:
+        return False
+    if state == "deleted":
+        return True
+    owner = profile_deletion_marker_owner(profile_home)
+    if owner is None:
+        return True
+    return _profile_marker_owner_is_alive(owner)
 
 
 def _get_platform_default_hermes_home() -> Path:

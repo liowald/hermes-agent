@@ -184,7 +184,8 @@ export class ProfileDeletionGate {
 export function assertLocalProfileCanStart(
   profile: unknown,
   gate: ProfileDeletionGate,
-  profileDirectoryExists: (profile: string) => boolean
+  profileDirectoryExists: (profile: string) => boolean,
+  externalDeletionActive: (profile: string) => boolean = () => false
 ): void {
   const key = String(profile ?? '')
     .trim()
@@ -192,9 +193,62 @@ export function assertLocalProfileCanStart(
 
   gate.assertCanStart(key)
 
+  if (key && key !== 'default' && externalDeletionActive(key)) {
+    throw new Error(`Profile "${key}" is being deleted.`)
+  }
+
   if (key && key !== 'default' && !profileDirectoryExists(key)) {
     throw new Error(`Profile "${key}" no longer exists.`)
   }
+}
+
+/** Hidden cross-process lease written by `hermes profile delete`. */
+export function profileDeletionMarkerName(profile: unknown): string {
+  const key = String(profile ?? '')
+    .trim()
+    .toLowerCase()
+
+  return `.deleting-${key}`
+}
+
+/**
+ * Active leases block while their owner lives; a completed `deleted` marker
+ * stays authoritative until an explicit profile create consumes it.
+ * Malformed markers fail closed.
+ */
+export function externalProfileDeletionActive(
+  profile: unknown,
+  readMarker: (name: string) => null | string,
+  ownerIsAlive: (pid: number) => boolean
+): boolean {
+  const key = String(profile ?? '')
+    .trim()
+    .toLowerCase()
+
+  if (!key || key === 'default') {
+    return false
+  }
+
+  const raw = readMarker(profileDeletionMarkerName(key))
+
+  if (raw === null) {
+    return false
+  }
+
+  const markerState = raw.trim()
+
+  if (markerState === 'deleted') {
+    return true
+  }
+
+  const owner = markerState.startsWith('deleting:') ? markerState.slice('deleting:'.length) : markerState
+  const pid = Number(owner)
+
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return true
+  }
+
+  return ownerIsAlive(pid)
 }
 
 /**

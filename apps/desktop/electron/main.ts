@@ -288,6 +288,7 @@ import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
   dispatchConnectionScopedProfileDelete,
+  externalProfileDeletionActive,
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
@@ -369,7 +370,7 @@ import {
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import { isPidAlive, readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
@@ -12023,8 +12024,28 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // here, and logging "Starting" first left an orphaned line with no READY
   // and no exit — the exact undiagnosable burst signature in remote-gateway
   // user bundles (Aug 2026, Dash's report).
-  assertLocalProfileCanStart(profile, profileDeletionGate, key =>
-    directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  assertLocalProfileCanStart(
+    profile,
+    profileDeletionGate,
+    key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    key =>
+      externalProfileDeletionActive(
+        key,
+        markerName => {
+          try {
+            return fs.readFileSync(path.join(HERMES_HOME, 'profiles', markerName), 'utf8')
+          } catch (error: any) {
+            if (error?.code === 'ENOENT') {
+              return null
+            }
+
+            // The marker exists but could not be read: fail closed for this
+            // spawn attempt rather than racing a destructive operation.
+            return ''
+          }
+        },
+        pid => isPidAlive(pid)
+      )
   )
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)

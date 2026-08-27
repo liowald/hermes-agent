@@ -640,3 +640,32 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_skips_profile_deleted_after_snapshot(tmp_path):
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home, profile_deletion_marker_path
+
+    default_home = tmp_path / "default"
+    deleted_home = tmp_path / "home-ops"
+    (default_home / "cron").mkdir(parents=True)
+    deleted_home.mkdir()
+    profile_deletion_marker_path(deleted_home).write_text("deleted", encoding="utf-8")
+
+    ticked_homes = []
+    stop = threading.Event()
+
+    def tracking_tick(*args, **kwargs):
+        ticked_homes.append(get_hermes_home())
+        stop.set()
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=tracking_tick), \
+         patch.object(InProcessCronScheduler, "recover_interrupted", return_value=0), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        InProcessCronScheduler().start(
+            stop,
+            interval=0,
+            profile_homes=[("default", default_home), ("home-ops", deleted_home)],
+        )
+
+    assert ticked_homes == [default_home]
+    assert not (deleted_home / "cron").exists()

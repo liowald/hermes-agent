@@ -647,7 +647,11 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat,
             use_cron_store,
         )
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_constants import (
+            profile_deletion_blocks_start,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -656,8 +660,18 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
+        def active_profile_entries():
+            # The profile list is captured when the multiplex scheduler starts.
+            # A later delete leaves a durable tombstone so stale entries cannot
+            # recreate ``<profile>/cron`` on each heartbeat.
+            for entry in profile_homes:
+                home = entry[1] if isinstance(entry, tuple) else entry
+                if profile_deletion_blocks_start(home):
+                    continue
+                yield entry
+
         # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
+        for entry in active_profile_entries():
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
@@ -681,7 +695,7 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    for entry in profile_homes:
+                    for entry in active_profile_entries():
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
@@ -704,7 +718,7 @@ class InProcessCronScheduler(CronScheduler):
             else:
                 _tick_error = None
             # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
+            for entry in active_profile_entries():
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:

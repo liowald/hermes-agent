@@ -29,11 +29,17 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import (
+    profile_deletion_blocks_start,
+    profile_deletion_marker_path,
+    profile_deletion_marker_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1022,6 +1028,8 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            if profile_deletion_blocks_start(entry):
+                continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
             if alias_name:
@@ -1107,6 +1115,8 @@ def profiles_to_serve(
                 continue  # default is the built-in entry already added above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            if profile_deletion_blocks_start(entry):
+                continue
             if allowed is not None and name not in allowed:
                 continue
             serve.append((name, entry))
@@ -1121,6 +1131,56 @@ def profiles_to_serve(
             )
 
     return serve
+
+
+@contextmanager
+def _hold_profile_deletion_marker(profile_dir: Path):
+    """Publish an active lease, then leave a durable successful tombstone."""
+    marker = profile_deletion_marker_path(profile_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    active_state = f"deleting:{os.getpid()}"
+
+    # O_EXCL makes the lease cross-process, not merely a convention around a
+    # shared path. A concurrent delete must never overwrite this owner and then
+    # have one caller unlink the other caller's protection on exit.
+    for _attempt in range(2):
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            existing = profile_deletion_marker_state(profile_dir)
+            if existing != "deleted" and profile_deletion_blocks_start(profile_dir):
+                raise RuntimeError(f"Profile '{profile_dir.name}' is already being deleted.")
+            marker.unlink(missing_ok=True)
+            continue
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(active_state)
+                handle.flush()
+                os.fsync(handle.fileno())
+            break
+    else:  # pragma: no cover - only a hostile concurrent marker churn can hit
+        raise RuntimeError(f"Could not acquire deletion lease for profile '{profile_dir.name}'.")
+
+    try:
+        yield marker
+    except BaseException:
+        # The profile may still be valid. Do not strand it behind a tombstone
+        # when teardown failed or the operation was interrupted cleanly.
+        if profile_deletion_marker_state(profile_dir) == active_state:
+            marker.unlink(missing_ok=True)
+        raise
+    else:
+        if profile_deletion_marker_state(profile_dir) != active_state:
+            raise RuntimeError(f"Profile '{profile_dir.name}' deletion lease changed unexpectedly.")
+        if profile_dir.exists():
+            # The caller can deliberately continue after a failed rmtree so it
+            # can reset active-profile metadata before surfacing the error.
+            marker.unlink(missing_ok=True)
+        else:
+            # Renderer caches and retained sockets can retry long after the
+            # delete call returns. Keep blocking those stale starts until an
+            # explicit create of the same profile name consumes this tombstone.
+            marker.write_text("deleted", encoding="utf-8")
 
 
 def create_profile(
@@ -1173,6 +1233,21 @@ def create_profile(
         )
 
     profile_dir = get_profile_dir(canon)
+
+    # A CLI profile delete can race a Desktop renderer reconnect. The delete
+    # publishes a process-owned marker beside the profile before terminating
+    # its backend; do not recreate that name while the owner is still alive.
+    # A completed tombstone authorizes an explicit create to discard any
+    # scheduler-created skeleton left behind by stale profile bookkeeping.
+    deletion_marker = profile_deletion_marker_path(profile_dir)
+    if deletion_marker.exists():
+        marker_state = deletion_marker.read_text(encoding="utf-8").strip()
+        if marker_state != "deleted" and profile_deletion_blocks_start(profile_dir):
+            raise RuntimeError(f"Profile '{canon}' is being deleted.")
+        if marker_state == "deleted" and profile_dir.exists():
+            shutil.rmtree(profile_dir)
+        deletion_marker.unlink(missing_ok=True)
+
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
@@ -1696,79 +1771,85 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if gw_running:
         _stop_gateway_process(profile_dir)
 
-    # 2b. Stop any other backends bound to this profile (Desktop-spawned
-    # serve/dashboard processes the gateway.pid file never names). They hold
-    # the profile's SQLite connection open and keep writing files, which makes
-    # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
-    # guard — resurrected the deleted tree.
-    _stop_profile_backends(canon, profile_dir)
+    # Publish before terminating any backend. Otherwise Desktop sees its child
+    # exit while the profile directory still exists, reconnects immediately,
+    # and recreates the just-deleted profile as an empty skeleton. The marker
+    # is process-owned and always released; Desktop also ignores a marker whose
+    # owner has died, so a crashed CLI cannot strand the profile name.
+    with _hold_profile_deletion_marker(profile_dir):
+        # 2b. Stop any other backends bound to this profile (Desktop-spawned
+        # serve/dashboard processes the gateway.pid file never names). They hold
+        # the profile's SQLite connection open and keep writing files, which makes
+        # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
+        # guard — resurrected the deleted tree.
+        _stop_profile_backends(canon, profile_dir)
 
-    # 2c. Release this process's holographic memory-store connections into
-    # the profile. The Desktop's *main* serve process opens memory_store.db
-    # for every known profile and is deliberately not stopped above, so on
-    # Windows its open handles make the rmtree below fail with WinError 32
-    # (#88347). When this delete runs inside serve (the DELETE
-    # /api/profiles/<name> route) the handles live in this process and are
-    # closed here; from the CLI this finds nothing and is a no-op.
-    try:
-        from plugins.memory.holographic.store import MemoryStore as _MemoryStore
+        # 2c. Release this process's holographic memory-store connections into
+        # the profile. The Desktop's *main* serve process opens memory_store.db
+        # for every known profile and is deliberately not stopped above, so on
+        # Windows its open handles make the rmtree below fail with WinError 32
+        # (#88347). When this delete runs inside serve (the DELETE
+        # /api/profiles/<name> route) the handles live in this process and are
+        # closed here; from the CLI this finds nothing and is a no-op.
+        try:
+            from plugins.memory.holographic.store import MemoryStore as _MemoryStore
 
-        _released = _MemoryStore.release_all_under(profile_dir)
-        if _released:
-            print(f"✓ Released {_released} memory-store connection(s) held by this process")
-    except Exception:
-        pass  # best-effort: never block the delete on the release path
+            _released = _MemoryStore.release_all_under(profile_dir)
+            if _released:
+                print(f"✓ Released {_released} memory-store connection(s) held by this process")
+        except Exception:
+            pass  # best-effort: never block the delete on the release path
 
-    # 3. Remove wrapper script
-    if has_wrapper:
-        if remove_wrapper_script(canon):
-            print(f"✓ Removed {wrapper_path}")
+        # 3. Remove wrapper script
+        if has_wrapper:
+            if remove_wrapper_script(canon):
+                print(f"✓ Removed {wrapper_path}")
 
-    # 4. Remove profile directory
-    remove_error: Exception | None = None
-    try:
-        def _make_writable(func, path, exc):
-            """onexc/onerror handler: add +w on PermissionError so rmtree can proceed.
+        # 4. Remove profile directory
+        remove_error: Exception | None = None
+        try:
+            def _make_writable(func, path, exc):
+                """onexc/onerror handler: add +w on PermissionError so rmtree can proceed.
 
-            Handles two cases on NixOS (and other systems with read-only
-            copies from immutable stores):
-            1. The path itself isn't writable (e.g. a file with mode 0444)
-            2. The *parent* directory isn't writable (e.g. mode 0555)
+                Handles two cases on NixOS (and other systems with read-only
+                copies from immutable stores):
+                1. The path itself isn't writable (e.g. a file with mode 0444)
+                2. The *parent* directory isn't writable (e.g. mode 0555)
 
-            Compatible with both the ``onexc`` API (3.12+, receives an
-            exception instance) and the ``onerror`` API (3.11-, receives
-            ``sys.exc_info()`` tuple).
-            """
-            import stat as _stat
+                Compatible with both the ``onexc`` API (3.12+, receives an
+                exception instance) and the ``onerror`` API (3.11-, receives
+                ``sys.exc_info()`` tuple).
+                """
+                import stat as _stat
 
-            # Normalise the two callback signatures:
-            #   onexc(func, path, exc_instance)   — 3.12+
-            #   onerror(func, path, exc_info_tuple) — 3.11
-            if isinstance(exc, tuple):
-                exc = exc[1]  # exc_info → actual exception object
+                # Normalise the two callback signatures:
+                #   onexc(func, path, exc_instance)   — 3.12+
+                #   onerror(func, path, exc_info_tuple) — 3.11
+                if isinstance(exc, tuple):
+                    exc = exc[1]  # exc_info → actual exception object
 
-            if isinstance(exc, PermissionError):
-                # Make the path writable
-                try:
-                    os.chmod(path, os.stat(path).st_mode | _stat.S_IWUSR)
-                except OSError:
-                    pass
-                # Also make the parent writable (needed for unlink/rmdir)
-                parent = os.path.dirname(path)
-                if parent:
+                if isinstance(exc, PermissionError):
+                    # Make the path writable
                     try:
-                        os.chmod(parent, os.stat(parent).st_mode | _stat.S_IWUSR)
+                        os.chmod(path, os.stat(path).st_mode | _stat.S_IWUSR)
                     except OSError:
                         pass
-                func(path)
-            else:
-                raise
+                    # Also make the parent writable (needed for unlink/rmdir)
+                    parent = os.path.dirname(path)
+                    if parent:
+                        try:
+                            os.chmod(parent, os.stat(parent).st_mode | _stat.S_IWUSR)
+                        except OSError:
+                            pass
+                    func(path)
+                else:
+                    raise
 
-        _rmtree_with_retry(profile_dir, _make_writable)
-        print(f"✓ Removed {profile_dir}")
-    except Exception as e:
-        print(f"⚠ Could not remove {profile_dir}: {e}")
-        remove_error = e
+            _rmtree_with_retry(profile_dir, _make_writable)
+            print(f"✓ Removed {profile_dir}")
+        except Exception as e:
+            print(f"⚠ Could not remove {profile_dir}: {e}")
+            remove_error = e
 
     # 5. Clear active_profile if it pointed to this profile
     try:

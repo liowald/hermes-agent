@@ -61,8 +61,24 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
 
+    def test_deleted_profile_tombstone_beats_existing_skeleton_and_memo(self, tmp_path):
+        from hermes_cli import config as cfg_mod
+        from hermes_constants import profile_deletion_marker_path
 
+        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        key = str(profile_home)
 
+        with patch.dict(os.environ, {"HERMES_HOME": key}):
+            ensure_hermes_home()
+            assert key in cfg_mod._HERMES_HOME_ENSURED
+
+            profile_deletion_marker_path(profile_home).write_text("deleted", encoding="utf-8")
+
+            with pytest.raises(FileNotFoundError, match="deleted or being deleted"):
+                ensure_hermes_home()
+
+        cfg_mod._HERMES_HOME_ENSURED.discard(key)
 
 
 class TestLoadConfigDefaults:
