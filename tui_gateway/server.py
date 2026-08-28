@@ -631,12 +631,27 @@ def _notify_session_boundary(
         pass
 
 
+_SESSION_OWNERSHIP_UNAVAILABLE = (
+    "Hermes could not safely reserve this session. Try again."
+)
+
+_AUTOMATIC_SESSION_END_REASONS = frozenset({
+    "ws_orphan_reap",
+    "ws_disconnect",
+    "idle_timeout",
+    "lru_evict",
+    "tui_shutdown",
+})
+
+
 def _claim_active_session_slot(
     session_key: str,
     *,
     live_session_id: str,
     surface: str = "tui",
+    profile_home: str | Path | None = None,
 ) -> tuple[Any, str | None]:
+    track_liveness = str(surface or "").strip().lower() == "desktop"
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
@@ -645,10 +660,16 @@ def _claim_active_session_slot(
             surface=surface,
             config=_load_cfg(),
             metadata={"live_session_id": live_session_id},
+            registry_home=profile_home,
+            track_liveness=track_liveness,
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
-        return None, None
+        return (
+            (None, _SESSION_OWNERSHIP_UNAVAILABLE)
+            if track_liveness
+            else (None, None)
+        )
 
 
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
@@ -671,6 +692,7 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
         str(session.get("session_key") or ""),
         live_session_id=sid,
         surface=_session_source(session),
+        profile_home=session.get("profile_home"),
     )
     if limit_message is not None:
         return limit_message
@@ -678,16 +700,89 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
-def _release_active_session_slot(session: dict | None) -> None:
-    if not session:
-        return
-    lease = session.pop("active_session_lease", None)
+def _release_active_session_lease(lease) -> bool:
     if lease is None:
+        return True
+    attempts = 3 if getattr(lease, "track_liveness", False) else 1
+    for attempt in range(attempts):
+        try:
+            lease.release()
+            break
+        except Exception:
+            if attempt + 1 >= attempts:
+                logger.warning("Failed to release active session slot", exc_info=True)
+                return False
+            time.sleep(0.05 * (attempt + 1))
+    released = getattr(lease, "released", True)
+    enabled = getattr(lease, "enabled", True)
+    return bool(released or not enabled)
+
+
+def _release_active_session_slot(session: dict | None) -> bool:
+    if not session:
+        return True
+    lease = session.get("active_session_lease")
+    if _release_active_session_lease(lease):
+        if session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def _other_runtime_lease_guard(session_id: str, session: dict):
+    """Release this runtime and lock sibling ownership through the DB write."""
+    lease = session.get("active_session_lease")
+    try:
+        from hermes_cli.active_sessions import (
+            active_session_liveness_guard,
+            release_active_session_liveness_guard,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to load active session ownership guard; preserving session %s: %s",
+            session_id,
+            exc,
+        )
+        yield True
+        return
+
+    last_error: Exception | None = None
+    stack = contextlib.ExitStack()
+    for attempt in range(3):
+        try:
+            if lease is not None and getattr(lease, "enabled", False):
+                guard = release_active_session_liveness_guard(lease, session_id)
+            else:
+                guard = active_session_liveness_guard(
+                    session_id, registry_home=session.get("profile_home")
+                )
+            active = stack.enter_context(guard)
+            break
+        except Exception as exc:
+            stack.close()
+            stack = contextlib.ExitStack()
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    else:
+        logger.warning(
+            "Failed to inspect active session leases; preserving session %s: %s",
+            session_id,
+            last_error,
+        )
+        yield True
         return
     try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+        yield active
+    finally:
+        stack.close()
+        if (
+            lease is not None
+            and getattr(lease, "released", False)
+            and session.get("active_session_lease") is lease
+        ):
+            session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -713,6 +808,9 @@ def _transfer_active_session_slot(
     except Exception:
         logger.debug("Failed to transfer active session slot", exc_info=True)
 
+    if getattr(lease, "track_liveness", False):
+        return False
+
     # Fallback: the in-place transfer could not move the lease (entry pruned /
     # pid-check transiently failed). Reserve the new slot BEFORE releasing the
     # old one, so a concurrent gateway at the session cap cannot grab the freed
@@ -722,6 +820,7 @@ def _transfer_active_session_slot(
         new_session_id,
         live_session_id=sid,
         surface=_session_source(session),
+        profile_home=session.get("profile_home"),
     )
     if new_lease is not None:
         old_lease = session.pop("active_session_lease", None)
@@ -796,7 +895,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
-    _release_active_session_slot(session)
+    _desktop_automatic_cleanup = bool(
+        end_reason in _AUTOMATIC_SESSION_END_REASONS
+        and _session_source(session).strip().lower() == "desktop"
+    )
+    # Automatic Desktop cleanup removes its lease inside the lock-held lifecycle
+    # guard below. Explicit close and non-Desktop paths keep force/end semantics.
+    if not _desktop_automatic_cleanup:
+        _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
@@ -864,27 +970,42 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
     # continuation. Fix for #20001.
-    _tui_owns_lifecycle = True
-    if session_id:
-        try:
-            # End the row in the *session's* profile state.db (app-global
-            # remote mode), not the launch profile's shared handle.
-            with _session_db(session) as db:
-                if db is not None:
-                    # Don't end gateway-originated sessions — the gateway owns
-                    # their lifecycle.  The TUI is a viewer, not the owner.
-                    # Ending a gateway session in state.db triggers a Groundhog
-                    # Day routing loop: the gateway's #54878 self-heal detects
-                    # the stale entry, recovers to the parent session, context
-                    # compression splits back to the reaped child, and the cycle
-                    # repeats on every inbound message.  (#60609)
-                    row = db.get_session(session_id)
-                    source = (row or {}).get("source", "")
-                    _tui_owns_lifecycle = not _is_gateway_owned_source(source)
-                    if _tui_owns_lifecycle:
-                        db.end_session(session_id, end_reason)
-        except Exception:
-            pass
+    if _desktop_automatic_cleanup and not session_id:
+        _release_active_session_slot(session)
+    _lifecycle_guard = (
+        _other_runtime_lease_guard(session_id, session)
+        if _desktop_automatic_cleanup and session_id
+        else contextlib.nullcontext(False)
+    )
+    with _lifecycle_guard as _other_runtime_owns_lifecycle:
+        _tui_owns_lifecycle = not _other_runtime_owns_lifecycle
+        if _other_runtime_owns_lifecycle:
+            logger.info(
+                "Preserving session %s during %s: another backend owns an active lease",
+                session_id,
+                end_reason,
+            )
+        if session_id:
+            try:
+                # End the row in the *session's* profile state.db (app-global
+                # remote mode), not the launch profile's shared handle.
+                with _session_db(session) as db:
+                    if db is not None:
+                        # Don't end gateway-originated sessions — the gateway owns
+                        # their lifecycle.  The TUI is a viewer, not the owner.
+                        # Ending a gateway session in state.db triggers a Groundhog
+                        # Day routing loop: the gateway's #54878 self-heal detects
+                        # the stale entry, recovers to the parent session, context
+                        # compression splits back to the reaped child, and the cycle
+                        # repeats on every inbound message.  (#60609)
+                        row = db.get_session(session_id)
+                        source = (row or {}).get("source", "")
+                        if _is_gateway_owned_source(source):
+                            _tui_owns_lifecycle = False
+                        elif _tui_owns_lifecycle:
+                            db.end_session(session_id, end_reason)
+            except Exception:
+                pass
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -1374,9 +1495,8 @@ def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
     """On transport disconnect, reap the sessions that opted into
-    close_on_disconnect (sidecar/dashboard) immediately via the unified
-    ``_close_session_by_id`` path, and re-point the rest back to stdio so later
-    emits don't hit a dead socket.
+    close_on_disconnect (sidecar/dashboard) immediately and re-point the rest
+    at the detached transport so later emits don't hit a dead socket.
 
     Non-flagged detached sessions are handed to the grace-windowed WS-orphan
     reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
@@ -1391,47 +1511,57 @@ def _close_sessions_for_transport(
     reaped = 0
     detached = 0
     for sid, session in owned:
-        if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
-        else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            # UNLESS another window still shows the session: multi-window
-            # pop-outs all register as viewers, so on disconnect re-bind the
-            # session to the most recent surviving viewer instead of
-            # stranding the original window on the sentinel (#83716).
-            viewers = session.get("viewers")
-            if viewers:
-                viewers.pop(transport, None)
-            # Revalidate under the sessions lock before stomping (#77129):
-            # between the owned-sessions snapshot above and this write, a
-            # concurrent session.resume can rebind the session to a NEW live
-            # transport. Stomping it back onto the drop sentinel here would
-            # knock an attached client into detached state and arm an orphan
-            # reap against a session that has a live owner. If the transport
-            # already moved on to a different live transport, this disconnect
-            # has nothing left to tear down — skip the park AND the reap.
+        claimed_for_teardown = None
+        should_schedule_reap = False
+        # A session.resume fast-path rebinds its live session while holding
+        # _session_resume_lock. Take that lock before re-checking the snapshot
+        # so a reconnect cannot move the transport between this check and the
+        # close/detach ownership claim. Keep the slow teardown below both locks.
+        with _session_resume_lock:
             with _sessions_lock:
-                current = session.get("transport")
-                if (
-                    current is not transport
-                    and current is not None
-                    and not _transport_is_dead(current)
-                ):
+                current = _sessions.get(sid)
+                if current is not session:
                     continue
-                remaining = [
-                    (ts, v)
-                    for v, ts in (viewers or {}).items()
-                    if v is not transport and not _transport_is_dead(v)
-                ]
-                if remaining:
-                    remaining.sort(key=lambda kv: kv[0])
-                    session["transport"] = remaining[-1][1]
+                if current.get("transport") is not transport:
+                    # The reconnect owns this session now. Drop only the old
+                    # viewer registration; it must not affect the new owner.
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
                     continue
-                session["transport"] = _detached_ws_transport
-                session.pop("_client_gone_interrupt_requested", None)
+                if current.get("close_on_disconnect"):
+                    claimed_for_teardown = _pop_session_by_id(sid)
+                else:
+                    # Point detached sessions at the drop sentinel (NOT real
+                    # stdio) so _ws_session_is_orphaned recognizes them and
+                    # the grace-reap can actually fire; a standalone
+                    # `hermes --tui` keeps real _stdio. UNLESS another window
+                    # still shows the session: multi-window pop-outs all
+                    # register as viewers, so on disconnect re-bind the
+                    # session to the most recent surviving viewer instead of
+                    # stranding the original window on the sentinel (#83716).
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
+                    remaining = [
+                        (ts, viewer_transport)
+                        for viewer_transport, ts in (viewers or {}).items()
+                        if (
+                            viewer_transport is not transport
+                            and not _transport_is_dead(viewer_transport)
+                        )
+                    ]
+                    if remaining:
+                        remaining.sort(key=lambda item: item[0])
+                        current["transport"] = remaining[-1][1]
+                    else:
+                        current["transport"] = _detached_ws_transport
+                        current.pop("_client_gone_interrupt_requested", None)
+                        should_schedule_reap = True
+        if claimed_for_teardown is not None:
+            if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
+                reaped += 1
+        elif should_schedule_reap:
             detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
@@ -1441,6 +1571,15 @@ def _close_sessions_for_transport(
 
 
 def _shutdown_sessions() -> None:
+    # Durable-first (#94724 item 2): persist every session's un-flushed
+    # transcript within a bounded budget BEFORE the slow per-session
+    # teardown below (plugin hooks, memory commit, delegation interrupts,
+    # agent.close). A supervisor that SIGKILLs a slow shutdown mid-way can
+    # then no longer lose the transcripts — the flush already landed.
+    try:
+        _flush_sessions_before_exit()
+    except Exception:
+        pass
     try:
         _release_gateway_wake_owner()
     except Exception:
@@ -1460,6 +1599,176 @@ except (TypeError, ValueError):
     _SESSION_TTL_S = float(6 * 3600)
 _SESSION_TTL_S = max(0.0, _SESSION_TTL_S)
 _REAPER_SCAN_S = 300.0
+
+
+# ── Flush-on-kill + periodic incremental flush (#94724 item 2) ───────────
+# A `hermes serve` killed mid-update used to lose every un-flushed in-memory
+# session: the next RPC failed with "session-scoped RPC rejected: not in
+# memory (detached/reaped runtime)" and NO store held the transcript. #95576
+# made serves survive *future* updates; this closes the kill path itself:
+#   (a) SIGTERM/SIGINT run a bounded, best-effort flush of in-memory session
+#       transcripts to state.db BEFORE the normal shutdown path, chained to
+#       whatever handler was installed before (uvicorn's included);
+#   (b) the idle-reaper scan piggybacks a periodic incremental flush so even
+#       a SIGKILL loses at most one flush interval.
+try:
+    _EXIT_FLUSH_BUDGET_S = float(
+        os.environ.get("HERMES_TUI_EXIT_FLUSH_BUDGET_S") or 5.0
+    )
+except (TypeError, ValueError):
+    _EXIT_FLUSH_BUDGET_S = 5.0
+_EXIT_FLUSH_BUDGET_S = max(0.0, _EXIT_FLUSH_BUDGET_S)
+
+try:
+    _INCREMENTAL_FLUSH_INTERVAL_S = float(
+        os.environ.get("HERMES_TUI_SESSION_FLUSH_INTERVAL_S") or _REAPER_SCAN_S
+    )
+except (TypeError, ValueError):
+    _INCREMENTAL_FLUSH_INTERVAL_S = _REAPER_SCAN_S
+_INCREMENTAL_FLUSH_INTERVAL_S = max(0.0, _INCREMENTAL_FLUSH_INTERVAL_S)
+
+
+def _flush_session_messages(session: dict | None) -> bool:
+    """Best-effort durable flush of one session's in-memory transcript.
+
+    Rides ``agent._persist_session`` — the same marker-deduped persist
+    contract ``_finalize_session`` uses (#13121) — so repeated calls only
+    write genuinely-unflushed messages and never duplicate durable rows.
+    """
+    if not session:
+        return False
+    agent = session.get("agent")
+    if agent is None or not hasattr(agent, "_persist_session"):
+        return False
+    snapshot = getattr(agent, "_session_messages", None)
+    if not snapshot:
+        return False
+    try:
+        agent._persist_session(snapshot)
+        return True
+    except Exception:
+        logger.debug("incremental session flush failed", exc_info=True)
+        return False
+
+
+def _flush_dirty_sessions(now: float | None = None) -> int:
+    """Periodic incremental flush, driven by the idle-reaper scan.
+
+    Skips ``running`` sessions: the turn thread owns mid-turn persistence
+    (it already flushes at every persist point) and
+    ``_drop_trailing_empty_response_scaffolding`` mutates the live message
+    list, so racing an in-flight turn from the reaper thread is never safe.
+    Idle/detached sessions — precisely the ones a kill strands — are flushed
+    at most once per ``_INCREMENTAL_FLUSH_INTERVAL_S``. ``now`` is injectable
+    for tests (monotonic clock).
+    """
+    if _INCREMENTAL_FLUSH_INTERVAL_S <= 0:
+        return 0
+    if now is None:
+        now = time.monotonic()
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    flushed = 0
+    for session in sessions:
+        if not isinstance(session, dict) or session.get("running"):
+            continue
+        last = float(session.get("_last_incremental_flush") or 0.0)
+        if last and (now - last) < _INCREMENTAL_FLUSH_INTERVAL_S:
+            continue
+        if _flush_session_messages(session):
+            flushed += 1
+        session["_last_incremental_flush"] = now
+    return flushed
+
+
+def _flush_sessions_before_exit(budget_s: float | None = None) -> int:
+    """Bounded flush of ALL in-memory sessions on the way out.
+
+    Runs on a daemon worker joined with the budget so a hung SQLite write
+    can never block exit longer than ``HERMES_TUI_EXIT_FLUSH_BUDGET_S``
+    (default 5s). Running sessions are included — the process is dying, so
+    a best-effort partial transcript beats guaranteed loss.
+    """
+    budget = _EXIT_FLUSH_BUDGET_S if budget_s is None else max(0.0, budget_s)
+    if budget <= 0:
+        return 0
+    result = {"flushed": 0}
+
+    def _run() -> None:
+        deadline = time.monotonic() + budget
+        with _sessions_lock:
+            sessions = list(_sessions.values())
+        for session in sessions:
+            if time.monotonic() >= deadline:
+                break
+            if _flush_session_messages(session):
+                result["flushed"] += 1
+
+    worker = threading.Thread(target=_run, daemon=True, name="hermes-exit-flush")
+    worker.start()
+    worker.join(budget)
+    return result["flushed"]
+
+
+_exit_flush_prev_handlers: dict[int, Any] = {}
+_exit_flush_handlers_installed = False
+
+
+def _handle_exit_flush_signal(signum, frame) -> None:
+    """Flush in-memory sessions, then hand off to the prior handler.
+
+    Chaining preserves the pre-existing signal story (uvicorn's graceful
+    shutdown, a supervisor's handler, or the default terminate disposition)
+    — this handler only *prepends* a bounded durable flush.
+    """
+    try:
+        _flush_sessions_before_exit()
+    except Exception:
+        pass
+    import signal as _signal
+
+    prev = _exit_flush_prev_handlers.get(signum)
+    if callable(prev):
+        prev(signum, frame)
+        return
+    if prev is _signal.SIG_IGN:
+        return
+    # Default disposition: restore it and re-raise so the process still dies
+    # with the correct signal (exit status visible to supervisors).
+    try:
+        _signal.signal(signum, _signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    except Exception:
+        raise SystemExit(128 + int(signum)) from None
+
+
+def install_exit_flush_signal_handlers() -> bool:
+    """Install chaining SIGTERM/SIGINT flush handlers (main thread only).
+
+    Called by ``hermes serve`` / dashboard startup before uvicorn takes over
+    signals: uvicorn's ``capture_signals()`` saves these as the "original"
+    handlers and restores + re-raises into them after its graceful shutdown,
+    so the flush also covers terminations outside uvicorn's serve window.
+    Idempotent; returns False off the main thread or when installation fails.
+    """
+    global _exit_flush_handlers_installed
+    if _exit_flush_handlers_installed:
+        return True
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    import signal as _signal
+
+    installed = False
+    for signum in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            prev = _signal.getsignal(signum)
+            _signal.signal(signum, _handle_exit_flush_signal)
+            _exit_flush_prev_handlers[signum] = prev
+            installed = True
+        except (ValueError, OSError, RuntimeError):
+            continue
+    _exit_flush_handlers_installed = installed
+    return installed
 
 
 def _transport_is_dead(transport) -> bool:
@@ -1491,6 +1800,13 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 
 def _reap_idle_sessions() -> None:
     now = time.time()
+    # Piggyback the periodic incremental flush on the existing reaper tick
+    # (#94724 item 2) — no new timer subsystem. Even a SIGKILL then loses at
+    # most one flush interval of un-persisted messages.
+    try:
+        _flush_dirty_sessions()
+    except Exception:
+        logger.debug("periodic incremental session flush failed", exc_info=True)
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
     for sid in victims:
@@ -1686,6 +2002,13 @@ def _sweep_orphaned_session_rows() -> list[str]:
     process still holds in memory (e.g. a ``session.resume`` during the
     startup grace window) are excluded so the sweep never races a
     mid-reconnect client.
+
+    Cross-backend liveness (#94895): when one ``state.db`` is shared by
+    N serve / gateway processes, each registered a heartbeat row in
+    ``gateway_heartbeats``. The sweep refuses to close a row that any
+    live backend (heartbeat refreshed within ``2 * TTL``) could
+    plausibly own — see ``SessionDB.sweep_orphaned_sessions`` for the
+    exact predicate.
     """
     db = _get_db()
     if db is None:
@@ -1706,6 +2029,138 @@ def _sweep_orphaned_session_rows() -> list[str]:
             ", ".join(swept),
         )
     return swept
+
+
+# ── Cross-backend heartbeat (#94895) ───────────────────────────────────
+# Each serve / gateway process registers a heartbeat row in
+# ``gateway_heartbeats`` so the startup orphan sweep can tell "row owned
+# by a live but idle backend" from "row truly orphaned".  Without this,
+# the first process to restart in a multi-backend topology reaped every
+# inactive row — including those held by the other N−1 still-running
+# processes (the #94895 reporter saw 473 sessions disappear in one shot).
+#
+# Refresh cadence: every HEARTBEAT_REFRESH_S (default 60s — much shorter
+# than the default 6h session TTL so a refresh always lands inside the
+# staleness window).  The heartbeat is removed at process exit so a
+# graceful shutdown doesn't leave a stale row behind.  A crashed process
+# leaves its row until the heartbeat ages out of the staleness window,
+# at which point the sweep treats it as dead.
+
+_HEARTBEAT_REFRESH_S = float(
+    os.environ.get("HERMES_GATEWAY_HEARTBEAT_REFRESH_S") or 60.0
+)
+_HEARTBEAT_REFRESH_S = max(0.0, _HEARTBEAT_REFRESH_S)
+
+_heartbeat_refresher_started = False
+_heartbeat_refresher_lock = threading.Lock()
+
+
+def _backend_id_for_this_process() -> str:
+    """Stable identity for this process's heartbeat row (#94895).
+
+    Includes pid AND a startup-time nonce so a PID-reuse respawn cannot
+    inherit the dead predecessor's heartbeat and protect truly orphaned
+    sessions.  The pid is kept for human readability in diagnostics.
+    """
+    nonce = getattr(_backend_id_for_this_process, "_nonce", None)
+    if nonce is None:
+        import secrets as _secrets
+
+        nonce = _secrets.token_hex(4)
+        try:
+            setattr(_backend_id_for_this_process, "_nonce", nonce)
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+    return f"{_current_profile_name()}@{os.uname().nodename if hasattr(os, 'uname') else 'host'}:{os.getpid()}:{nonce}"
+
+
+def _refresh_backend_heartbeat() -> None:
+    """Refresh this backend's heartbeat row (#94895). No-op when DB unavailable."""
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        db.register_backend_heartbeat(
+            backend_id=_backend_id_for_this_process(),
+            pid=os.getpid(),
+            started_at=_gateway_started_at(),
+            profile=_current_profile_name(),
+            host=(os.uname().nodename if hasattr(os, "uname") else "host"),
+        )
+    except Exception:
+        logger.debug("backend heartbeat refresh failed", exc_info=True)
+
+
+def _gateway_started_at() -> float:
+    """Wall-clock time when this process started. Module-import time is
+    a good-enough proxy: the heartbeat refresher runs after the gateway
+    is fully wired up.
+    """
+    started = getattr(_gateway_started_at, "_t", None)
+    if started is None:
+        started = time.time()
+        try:
+            setattr(_gateway_started_at, "_t", started)
+        except AttributeError:  # pragma: no cover
+            pass
+    return started
+
+
+def _heartbeat_refresher_loop(stop_event: threading.Event) -> None:
+    """Background loop that refreshes the heartbeat on a fixed cadence."""
+    while not stop_event.is_set():
+        try:
+            _refresh_backend_heartbeat()
+        except Exception:
+            logger.debug("heartbeat refresh loop iteration failed", exc_info=True)
+        stop_event.wait(_HEARTBEAT_REFRESH_S)
+
+
+def _start_backend_heartbeat_refresher() -> None:
+    """Register this backend and start the refresher thread (#94895).
+
+    Called once per process from both gateway entry points.  The first
+    refresh writes the row immediately so even a very fast crash leaves
+    a fresh-enough row that other backends can see.  Repeat calls are
+    no-ops.  The refresher thread is only spawned when
+    ``_HEARTBEAT_REFRESH_S > 0`` — a refresh interval of zero means
+    "register the row once, never refresh" (the row ages out naturally
+    after the heartbeat staleness window).
+    """
+    global _heartbeat_refresher_started
+    with _heartbeat_refresher_lock:
+        if _heartbeat_refresher_started:
+            return
+        _heartbeat_refresher_started = True
+    # Write a row synchronously so the sweep run later in this same
+    # process can see ourselves in the heartbeat table too.  Without
+    # this, exclude_ids would have to cover every local session — a
+    # regression in the strict-ownership case the heartbeat exists to fix.
+    try:
+        _refresh_backend_heartbeat()
+    except Exception:
+        logger.debug("initial backend heartbeat write failed", exc_info=True)
+    if _HEARTBEAT_REFRESH_S <= 0:
+        return
+    stop_event = threading.Event()
+
+    def _atexit_clear():
+        stop_event.set()
+        try:
+            db = _get_db()
+            if db is not None:
+                db.clear_backend_heartbeat(_backend_id_for_this_process())
+        except Exception:
+            pass
+
+    atexit.register(_atexit_clear)
+    thread = threading.Thread(
+        target=_heartbeat_refresher_loop,
+        args=(stop_event,),
+        name="hermes-gateway-heartbeat",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _schedule_startup_orphan_sweep() -> None:
@@ -5907,6 +6362,73 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     return tuple(sorted(picked.items()))
 
 
+def _compressor_ctor_default(name: str, fallback: Any) -> Any:
+    """Read a normalized default from ContextCompressor's REAL signature.
+
+    Unset restoration must go through the same derivation the construction
+    path uses (#94724 review finding on #95980) — pulling the default off
+    ``ContextCompressor.__init__`` itself instead of hardcoding copies keeps
+    the two from drifting.
+    """
+    try:
+        import inspect
+
+        from agent.context_compressor import ContextCompressor
+
+        default = inspect.signature(ContextCompressor.__init__).parameters[
+            name
+        ].default
+        if default is inspect.Parameter.empty:
+            return fallback
+        return default
+    except Exception:
+        return fallback
+
+
+def _derived_default_threshold_percent(agent: Any, compression: dict) -> float:
+    """Default compaction threshold when ``compression.threshold`` is unset.
+
+    Mirrors agent_init exactly: the ctor's global default, then the per-model
+    resolution (Codex gpt-5.4/5.5 + spark autoraise, Arcee Trinity, etc.)
+    via the SAME ``_resolve_compression_threshold`` helper — so removing the
+    key restores the model-derived value, not a bare constant.
+    """
+    try:
+        pct = float(_compressor_ctor_default("threshold_percent", 0.50))
+    except (TypeError, ValueError):
+        pct = 0.50
+    try:
+        from agent.agent_init import _resolve_compression_threshold
+        from agent.auxiliary_client import (
+            _compression_threshold_for_model,
+            _is_codex_gpt54_or_gpt55,
+            _is_codex_spark,
+        )
+
+        model = getattr(agent, "model", "") or ""
+        provider = getattr(agent, "provider", "") or ""
+        autoraise_enabled = str(
+            compression.get("codex_gpt55_autoraise", True)
+        ).lower() in {"true", "1", "yes"}
+        model_cthresh = _compression_threshold_for_model(
+            model,
+            provider,
+            allow_codex_gpt55_autoraise=autoraise_enabled,
+        )
+        pct, _notice = _resolve_compression_threshold(
+            pct,
+            model_cthresh,
+            model=model,
+            is_codex_autoraise=(
+                _is_codex_gpt54_or_gpt55(model, provider)
+                or _is_codex_spark(model, provider)
+            ),
+        )
+    except Exception:
+        pass
+    return pct
+
+
 def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     """Update a live session's compressor from current config.yaml.
 
@@ -5914,6 +6436,15 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     Recomputes the trigger from the ratio-based threshold and then applies
     ``compression.threshold_tokens`` so raising, lowering, or clearing the
     cap all take effect on the next preflight.
+
+    Every adopted key has UNSET semantics (#94724 review finding on the
+    merged #95980): removing a key from config.yaml restores the normalized
+    default — or the model-derived value — on the next turn, through the
+    same derivation the construction path uses (ContextCompressor ctor
+    defaults read off its real signature, the Codex threshold autoraise via
+    ``_resolve_compression_threshold``, context-length re-inference via the
+    deferred ``get_model_context_length`` resolution). The old behavior
+    acted only on PRESENT keys, leaving stale values active forever.
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
@@ -5925,10 +6456,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     else:
         agent.compression_enabled = str(enabled_raw).lower() in {"true", "1", "yes"}
 
-    idle_raw = compression.get(
-        "idle_compact_after_seconds",
-        getattr(agent, "compression_idle_compact_after_seconds", 0),
-    )
+    # Absence restores the agent_init/config default (0 = disabled).
+    idle_raw = compression.get("idle_compact_after_seconds", 0)
     try:
         agent.compression_idle_compact_after_seconds = max(0, int(idle_raw or 0))
     except (TypeError, ValueError):
@@ -5938,31 +6467,55 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     if cc is None:
         return
 
-    if "tail_mode" in compression:
-        mode = str(compression.get("tail_mode") or "legacy").strip().lower()
-        cc.tail_mode = mode if mode in ("legacy", "lean") else "legacy"
+    # tail_mode: ctor normalization — unknown/absent values land on "lean",
+    # matching agent_init's default and the compressor's own fallback.
+    default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
+    mode = str(compression.get("tail_mode", default_tail) or default_tail)
+    mode = mode.strip().lower()
+    cc.tail_mode = mode if mode in ("legacy", "lean") else default_tail
 
     def _assign_int(key: str, attr: str, default: int, min_value: int = 0) -> None:
-        if key not in compression:
-            return
+        raw = compression.get(key, default)
         try:
-            raw = compression.get(key)
             value = default if raw is None else int(raw)
-            setattr(cc, attr, max(min_value, value))
         except (TypeError, ValueError):
             return
+        setattr(cc, attr, max(min_value, value))
 
-    _assign_int("proactive_prune_tokens", "proactive_prune_tokens", 0)
-    _assign_int("proactive_prune_min_result_chars", "proactive_prune_min_result_chars", 8000)
-    _assign_int("proactive_prune_min_reclaim_tokens", "proactive_prune_min_reclaim_tokens", 0)
-    _assign_int("protect_last_n", "protect_last_n", 20)
-    _assign_int("min_tail_user_messages", "min_tail_user_messages", 1, min_value=1)
+    _assign_int(
+        "proactive_prune_tokens",
+        "proactive_prune_tokens",
+        int(_compressor_ctor_default("proactive_prune_tokens", 0)),
+    )
+    _assign_int(
+        "proactive_prune_min_result_chars",
+        "proactive_prune_min_result_chars",
+        int(_compressor_ctor_default("proactive_prune_min_result_chars", 8000)),
+    )
+    _assign_int(
+        "proactive_prune_min_reclaim_tokens",
+        "proactive_prune_min_reclaim_tokens",
+        int(_compressor_ctor_default("proactive_prune_min_reclaim_tokens", 4096)),
+    )
+    _assign_int(
+        "protect_last_n",
+        "protect_last_n",
+        int(_compressor_ctor_default("protect_last_n", 20)),
+    )
+    _assign_int(
+        "min_tail_user_messages",
+        "min_tail_user_messages",
+        int(_compressor_ctor_default("min_tail_user_messages", 1)),
+        min_value=1,
+    )
 
-    if "target_ratio" in compression:
-        try:
-            cc.summary_target_ratio = max(0.10, min(float(compression["target_ratio"]), 0.80))
-        except (TypeError, ValueError):
-            pass
+    try:
+        ratio_raw = compression.get(
+            "target_ratio", _compressor_ctor_default("summary_target_ratio", 0.20)
+        )
+        cc.summary_target_ratio = max(0.10, min(float(ratio_raw), 0.80))
+    except (TypeError, ValueError):
+        pass
 
     raw_thresholds = compression.get("model_thresholds")
     if isinstance(raw_thresholds, dict):
@@ -5971,34 +6524,46 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
             for k, v in raw_thresholds.items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         }
+    else:
+        # Absent (or invalid shape — agent_init treats both as empty):
+        # stale per-model overrides must stop steering the live threshold.
+        cc.model_thresholds = {}
 
+    # threshold: present value wins; absence derives the default through
+    # the same agent_init resolution (global default + per-model autoraise).
+    pct: float | None = None
     if "threshold" in compression:
         try:
             pct = float(compression["threshold"])
-            cc._config_threshold_percent = pct
-            cc._configured_threshold_percent = pct
-            base = pct
-            model_thresholds = getattr(cc, "model_thresholds", None) or {}
-            if model_thresholds:
-                from agent.context_compressor import resolve_model_threshold
-
-                base = resolve_model_threshold(
-                    getattr(agent, "model", "") or "",
-                    model_thresholds,
-                    pct,
-                )
-            cc._base_threshold_percent = base
-            if hasattr(cc, "_effective_threshold_percent"):
-                try:
-                    cc.threshold_percent = cc._effective_threshold_percent(
-                        cc.context_length, base
-                    )
-                except Exception:
-                    cc.threshold_percent = pct
-            else:
-                cc.threshold_percent = pct
         except (TypeError, ValueError):
-            pass
+            pct = None
+    if pct is None:
+        pct = _derived_default_threshold_percent(agent, compression)
+    try:
+        cc._config_threshold_percent = pct
+        cc._configured_threshold_percent = pct
+        base = pct
+        model_thresholds = getattr(cc, "model_thresholds", None) or {}
+        if model_thresholds:
+            from agent.context_compressor import resolve_model_threshold
+
+            base = resolve_model_threshold(
+                getattr(agent, "model", "") or "",
+                model_thresholds,
+                pct,
+            )
+        cc._base_threshold_percent = base
+        if hasattr(cc, "_effective_threshold_percent"):
+            try:
+                cc.threshold_percent = cc._effective_threshold_percent(
+                    cc.context_length, base
+                )
+            except Exception:
+                cc.threshold_percent = pct
+        else:
+            cc.threshold_percent = pct
+    except (TypeError, ValueError):
+        pass
 
     raw_ctx = model_cfg.get("context_length")
     if raw_ctx is not None:
@@ -6012,6 +6577,14 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
                 cc.context_length = new_ctx
             except Exception:
                 pass
+    elif getattr(cc, "_config_context_length", None) is not None:
+        # model.context_length removed: drop the config override and force
+        # re-inference from model metadata on next access — the same
+        # deferred get_model_context_length resolution agent construction
+        # uses (#32221). The re-resolve also re-applies the small-context
+        # threshold floor for the genuinely re-inferred window.
+        cc._config_context_length = None
+        cc._resolved_context_length = None
 
     coerce_cap = getattr(cc, "_coerce_threshold_tokens_cap", None)
     if callable(coerce_cap):
@@ -6022,6 +6595,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
             cc.threshold_tokens_cap = cap if cap > 0 else None
         except (TypeError, ValueError):
             cc.threshold_tokens_cap = None
+    else:
+        cc.threshold_tokens_cap = None
 
     # Invalidate cached trigger so the next preflight re-derives from the
     # current percent/window and then applies the (possibly new) cap.
