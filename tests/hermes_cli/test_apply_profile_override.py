@@ -16,8 +16,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
@@ -111,48 +109,6 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir)
         assert sys.argv == ["hermes", "gateway", "install", "--system"]
-
-    def test_inherited_profile_home_rejects_active_deletion_before_startup(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        hermes_root = tmp_path / ".hermes"
-        profile_dir = hermes_root / "profiles" / "coder"
-        profile_dir.mkdir(parents=True)
-        (profile_dir.parent / ".deleting-coder").write_text(f"deleting:{os.getpid()}")
-
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
-        monkeypatch.setattr(sys, "argv", ["hermes", "serve"])
-
-        from hermes_cli.main import _apply_profile_override
-
-        with pytest.raises(SystemExit) as exc:
-            _apply_profile_override()
-
-        assert exc.value.code == 1
-        assert "being deleted or was deleted" in capsys.readouterr().err
-        assert profile_dir.is_dir()
-
-    def test_explicit_profile_rejects_completed_deletion_tombstone(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        hermes_root = tmp_path / ".hermes"
-        profile_dir = hermes_root / "profiles" / "coder"
-        profile_dir.mkdir(parents=True)
-        (profile_dir.parent / ".deleting-coder").write_text("deleted")
-
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.delenv("HERMES_HOME", raising=False)
-        monkeypatch.setattr(sys, "argv", ["hermes", "--profile", "coder", "serve"])
-
-        from hermes_cli.main import _apply_profile_override
-
-        with pytest.raises(SystemExit) as exc:
-            _apply_profile_override()
-
-        assert exc.value.code == 1
-        assert "being deleted or was deleted" in capsys.readouterr().err
-        assert os.environ.get("HERMES_HOME") is None
 
 
 

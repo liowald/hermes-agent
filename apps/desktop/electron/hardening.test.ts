@@ -388,7 +388,6 @@ test('writeSecretFileAtomic does not inherit loose bits from a stale temp file',
   withTempDir(dir => {
     const target = path.join(dir, 'connection.json')
     fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
-    fs.chmodSync(`${target}.tmp`, 0o666)
     assert.notEqual(modeOf(`${target}.tmp`), SECRET_FILE_MODE)
 
     writeSecretFileAtomic(target, 'fresh')
@@ -458,7 +457,6 @@ test('writeSecretFileAtomic cannot be redirected through a symlink planted at th
     const target = path.join(dir, 'connection.json')
     const victim = path.join(dir, 'victim.txt')
     fs.writeFileSync(victim, 'original', { mode: 0o644 })
-    fs.chmodSync(victim, 0o644)
 
     try {
       fs.symlinkSync(victim, `${target}.tmp`, 'file')
@@ -498,7 +496,6 @@ test('tightenSecretFileMode tightens a pre-existing world-readable config in pla
     })
 
     fs.writeFileSync(target, legacy, { mode: 0o644 })
-    fs.chmodSync(target, 0o644)
     assert.equal(modeOf(target), 0o644)
 
     assert.equal(tightenSecretFileMode(target), true)
@@ -553,7 +550,6 @@ test('tightenSecretFileMode refuses to chmod a symlink instead of following it t
     const target = path.join(dir, 'connection.json')
     const victim = path.join(dir, 'victim.txt')
     fs.writeFileSync(victim, 'not mine', { mode: 0o644 })
-    fs.chmodSync(victim, 0o644)
 
     try {
       fs.symlinkSync(victim, target, 'file')

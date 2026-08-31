@@ -564,9 +564,7 @@ def _apply_profile_override() -> None:
 
         candidate = home / ".hermes" / "profiles" / name
         try:
-            from hermes_constants import profile_deletion_blocks_start
-
-            if candidate.is_dir() and not profile_deletion_blocks_start(candidate):
+            if candidate.is_dir():
                 return str(candidate)
         except OSError:
             return None
@@ -630,21 +628,7 @@ def _apply_profile_override() -> None:
     # See issue #22502.
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
-        inherited_profile_home = Path(hermes_home_env)
-        if inherited_profile_home.parent.name == "profiles":
-            # Desktop and other launchers inherit HERMES_HOME into profile
-            # children.  A CLI deletion can publish its cross-process lease
-            # after the launcher preflight but before the child reaches this
-            # entry point, so the child itself is the authoritative final
-            # boundary.  Check before importing modules that may create state.
-            from hermes_constants import profile_deletion_blocks_start
-
-            if profile_deletion_blocks_start(inherited_profile_home):
-                print(
-                    f"Error: Profile '{inherited_profile_home.name}' is being deleted or was deleted.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+        if Path(hermes_home_env).parent.name == "profiles":
             return
 
     # 2. If no flag, check active_profile in the hermes root.
@@ -3453,6 +3437,7 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "oneshot": bool(getattr(args, "oneshot_exit", False)),
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
@@ -4225,6 +4210,7 @@ def select_provider_and_model(args=None):
         "nvidia",
         "ollama-cloud",
         "tencent-tokenhub",
+        "tencent-tokenplan",
         "lmstudio",
     } or _is_profile_api_key_provider(selected_provider):
         _model_flow_api_key_provider(config, selected_provider, current_model)
@@ -11181,7 +11167,7 @@ def cmd_profile(args):
 
             # Profile dir for display
             try:
-                profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+                profile_dir_display = "~/" + profile_dir.relative_to(Path.home()).as_posix()
             except ValueError:
                 profile_dir_display = str(profile_dir)
 
@@ -13312,7 +13298,7 @@ def main():
     )
     browser_close.add_argument(
         "--browser",
-        help="Override detected default browser (chrome/edge/brave/chromium)",
+        help="Override detected default browser (chrome/edge/brave/brave-origin/chromium)",
     )
 
     def _dispatch_browser(_args):

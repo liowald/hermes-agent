@@ -764,11 +764,7 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import (  # noqa: F811,E402
-    get_hermes_home,
-    get_process_hermes_home,
-    profile_deletion_blocks_start,
-)
+from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -962,27 +958,13 @@ def ensure_hermes_home():
     home = get_hermes_home()
     key = str(home)
 
-    # A deleted profile can be recreated as a one-directory skeleton by stale
-    # cron/profile-scoped callers before Desktop's backend-spawn guard runs.
-    # The lifecycle tombstone remains authoritative even when that skeleton
-    # exists, and must be checked before the memoized fast path.
-    if home.parent.name == "profiles" and profile_deletion_blocks_start(home):
-        raise FileNotFoundError(
-            f"Named profile home is deleted or being deleted: {home}. "
-            "Create the profile explicitly before using it."
-        )
-
+    # Named profiles must be created explicitly (e.g. ``hermes profile create``).
+    # Check tombstones before the memo so a stale empty shell cannot skip
+    # the deleted-profile guard.
+    from hermes_constants import assert_named_profile_home_live
+    assert_named_profile_home_live(home)
     if key in _HERMES_HOME_ENSURED and home.is_dir():
         return
-    # Named profiles must be created explicitly (e.g. ``hermes profile create``).
-    # If a stale process keeps running after the profile was renamed/deleted,
-    # silently mkdir-ing the old HERMES_HOME would resurrect an empty skeleton
-    # and make the deleted profile reappear in Desktop/profile lists.
-    if home.parent.name == "profiles" and not home.exists():
-        raise FileNotFoundError(
-            f"Named profile home does not exist: {home}. "
-            "Create the profile explicitly before using it."
-        )
     if is_managed():
         old_umask = os.umask(0o007)
         try:
@@ -1039,7 +1021,6 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
     5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
-    10: ["TAVILY_API_KEY"],
     11: ["TERMINAL_MODAL_MODE"],
 }
 
@@ -1244,7 +1225,7 @@ def _is_env_config_key(key: str) -> bool:
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
-        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
+        'TOOL_GATEWAY_USER_TOKEN',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
@@ -1498,7 +1479,7 @@ def _normalize_custom_provider_entry(
         "models_discovered",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body", "extra_headers",
+        "discover_models", "extra_body", "extra_headers", "capabilities",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1622,6 +1603,16 @@ def _normalize_custom_provider_entry(
 
     if models_discovered:
         normalized["models_discovered"] = True
+
+    capabilities = entry.get("capabilities")
+    if isinstance(capabilities, dict):
+        normalized_capabilities = {
+            key: value
+            for key, value in capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
+        if normalized_capabilities:
+            normalized["capabilities"] = normalized_capabilities
 
     context_length = entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
@@ -3658,6 +3649,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_mode": "TERMINAL_MODAL_MODE",
     "degraded_mode": "TERMINAL_DEGRADED_MODE",
     "cwd": "TERMINAL_CWD",
+    "temp_dir": "TERMINAL_TEMP_DIR",
     "timeout": "TERMINAL_TIMEOUT",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
@@ -4834,7 +4826,6 @@ def show_config():
         ("EXA_API_KEY", "Exa"),
         ("PARALLEL_API_KEY", "Parallel"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
-        ("TAVILY_API_KEY", "Tavily"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),

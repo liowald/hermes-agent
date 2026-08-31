@@ -29,16 +29,21 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.archive_safe import (
+    archive_root_dirs,
+    make_targz,
+    normalize_archive_parts,
+    safe_extract_targz,
+)
 from hermes_constants import (
-    profile_deletion_blocks_start,
-    profile_deletion_marker_path,
-    profile_deletion_marker_state,
+    clear_named_profile_deleted,
+    mark_named_profile_deleted,
+    named_profile_is_deleted,
 )
 
 logger = logging.getLogger(__name__)
@@ -386,11 +391,12 @@ def get_profile_dir(name: str) -> Path:
 
 
 def profile_exists(name: str) -> bool:
-    """Check whether a profile directory exists."""
+    """Check whether a live (non-tombstoned) profile directory exists."""
     canon = normalize_profile_name(name)
     if canon == "default":
         return True
-    return get_profile_dir(canon).is_dir()
+    profile_dir = get_profile_dir(canon)
+    return profile_dir.is_dir() and not named_profile_is_deleted(profile_dir)
 
 
 def profile_matches_home(name: str, home: "Path | None" = None) -> bool:
@@ -764,6 +770,41 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
+def _seed_model_config(profile_dir: Path) -> None:
+    """Give a profile created without a clone source a usable model block.
+
+    Such a profile gets its directory tree but no ``config.yaml`` at all, so it
+    resolves no provider and its first turn dies with "No LLM provider
+    configured" — created, but unable to run. Copy the active profile's
+    ``model`` block over at creation time.
+
+    This is a copy, not a link: profiles remain independent islands, and
+    editing either one afterwards never touches the other. "Fresh" means fresh
+    skills and SOUL, not unreachable.
+    """
+    config_path = profile_dir / "config.yaml"
+    if config_path.exists():
+        return
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        source = get_hermes_home() / "config.yaml"
+        if not source.is_file():
+            return
+        model_cfg = read_user_config_raw(source).get("model")
+        if not model_cfg:
+            return
+        config_path.write_text(
+            yaml.safe_dump({"model": model_cfg}, sort_keys=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Creation must not fail over this; `hermes model` still sets it later.
+        pass
+
+
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory.
 
@@ -1028,7 +1069,7 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
-            if profile_deletion_blocks_start(entry):
+            if named_profile_is_deleted(entry):
                 continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
@@ -1115,7 +1156,7 @@ def profiles_to_serve(
                 continue  # default is the built-in entry already added above
             if not _PROFILE_ID_RE.match(name):
                 continue
-            if profile_deletion_blocks_start(entry):
+            if named_profile_is_deleted(entry):
                 continue
             if allowed is not None and name not in allowed:
                 continue
@@ -1131,56 +1172,6 @@ def profiles_to_serve(
             )
 
     return serve
-
-
-@contextmanager
-def _hold_profile_deletion_marker(profile_dir: Path):
-    """Publish an active lease, then leave a durable successful tombstone."""
-    marker = profile_deletion_marker_path(profile_dir)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    active_state = f"deleting:{os.getpid()}"
-
-    # O_EXCL makes the lease cross-process, not merely a convention around a
-    # shared path. A concurrent delete must never overwrite this owner and then
-    # have one caller unlink the other caller's protection on exit.
-    for _attempt in range(2):
-        try:
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            existing = profile_deletion_marker_state(profile_dir)
-            if existing != "deleted" and profile_deletion_blocks_start(profile_dir):
-                raise RuntimeError(f"Profile '{profile_dir.name}' is already being deleted.")
-            marker.unlink(missing_ok=True)
-            continue
-        else:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(active_state)
-                handle.flush()
-                os.fsync(handle.fileno())
-            break
-    else:  # pragma: no cover - only a hostile concurrent marker churn can hit
-        raise RuntimeError(f"Could not acquire deletion lease for profile '{profile_dir.name}'.")
-
-    try:
-        yield marker
-    except BaseException:
-        # The profile may still be valid. Do not strand it behind a tombstone
-        # when teardown failed or the operation was interrupted cleanly.
-        if profile_deletion_marker_state(profile_dir) == active_state:
-            marker.unlink(missing_ok=True)
-        raise
-    else:
-        if profile_deletion_marker_state(profile_dir) != active_state:
-            raise RuntimeError(f"Profile '{profile_dir.name}' deletion lease changed unexpectedly.")
-        if profile_dir.exists():
-            # The caller can deliberately continue after a failed rmtree so it
-            # can reset active-profile metadata before surfacing the error.
-            marker.unlink(missing_ok=True)
-        else:
-            # Renderer caches and retained sockets can retry long after the
-            # delete call returns. Keep blocking those stale starts until an
-            # explicit create of the same profile name consumes this tombstone.
-            marker.write_text("deleted", encoding="utf-8")
 
 
 def create_profile(
@@ -1233,23 +1224,15 @@ def create_profile(
         )
 
     profile_dir = get_profile_dir(canon)
-
-    # A CLI profile delete can race a Desktop renderer reconnect. The delete
-    # publishes a process-owned marker beside the profile before terminating
-    # its backend; do not recreate that name while the owner is still alive.
-    # A completed tombstone authorizes an explicit create to discard any
-    # scheduler-created skeleton left behind by stale profile bookkeeping.
-    deletion_marker = profile_deletion_marker_path(profile_dir)
-    if deletion_marker.exists():
-        marker_state = deletion_marker.read_text(encoding="utf-8").strip()
-        if marker_state != "deleted" and profile_deletion_blocks_start(profile_dir):
-            raise RuntimeError(f"Profile '{canon}' is being deleted.")
-        if marker_state == "deleted" and profile_dir.exists():
-            shutil.rmtree(profile_dir)
-        deletion_marker.unlink(missing_ok=True)
-
+    if profile_dir.exists() and named_profile_is_deleted(profile_dir):
+        # Empty shells left by post-delete mkdir may be replaced. Identity
+        # files mean the leftover is not a shell — fail closed, no rmtree.
+        if (profile_dir / "config.yaml").exists() or (profile_dir / ".env").exists():
+            raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
+        shutil.rmtree(profile_dir)
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
+    clear_named_profile_deleted(profile_dir)
 
     # Resolve clone source
     source_dir = None
@@ -1283,6 +1266,9 @@ def create_profile(
         profile_dir.mkdir(parents=True, exist_ok=True)
         for subdir in _PROFILE_DIRS:
             (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+        if source_dir is None:
+            _seed_model_config(profile_dir)
 
         # Clone config files from source
         if source_dir is not None:
@@ -1459,6 +1445,8 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
         if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
             continue
         if entry.name == "default":
+            continue
+        if named_profile_is_deleted(entry):
             continue
         env_path = entry / ".env"
         if env_path.exists():
@@ -1771,85 +1759,83 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if gw_running:
         _stop_gateway_process(profile_dir)
 
-    # Publish before terminating any backend. Otherwise Desktop sees its child
-    # exit while the profile directory still exists, reconnects immediately,
-    # and recreates the just-deleted profile as an empty skeleton. The marker
-    # is process-owned and always released; Desktop also ignores a marker whose
-    # owner has died, so a crashed CLI cannot strand the profile name.
-    with _hold_profile_deletion_marker(profile_dir):
-        # 2b. Stop any other backends bound to this profile (Desktop-spawned
-        # serve/dashboard processes the gateway.pid file never names). They hold
-        # the profile's SQLite connection open and keep writing files, which makes
-        # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
-        # guard — resurrected the deleted tree.
-        _stop_profile_backends(canon, profile_dir)
+    # 2b. Stop any other backends bound to this profile (Desktop-spawned
+    # serve/dashboard processes the gateway.pid file never names). They hold
+    # the profile's SQLite connection open and keep writing files, which makes
+    # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
+    # guard — resurrected the deleted tree.
+    _stop_profile_backends(canon, profile_dir)
 
-        # 2c. Release this process's holographic memory-store connections into
-        # the profile. The Desktop's *main* serve process opens memory_store.db
-        # for every known profile and is deliberately not stopped above, so on
-        # Windows its open handles make the rmtree below fail with WinError 32
-        # (#88347). When this delete runs inside serve (the DELETE
-        # /api/profiles/<name> route) the handles live in this process and are
-        # closed here; from the CLI this finds nothing and is a no-op.
-        try:
-            from plugins.memory.holographic.store import MemoryStore as _MemoryStore
+    # Tombstone before rmtree so a stale serve/logging mkdir cannot relist
+    # this name as a live profile.
+    mark_named_profile_deleted(profile_dir)
 
-            _released = _MemoryStore.release_all_under(profile_dir)
-            if _released:
-                print(f"✓ Released {_released} memory-store connection(s) held by this process")
-        except Exception:
-            pass  # best-effort: never block the delete on the release path
+    # 2c. Release this process's holographic memory-store connections into
+    # the profile. The Desktop's *main* serve process opens memory_store.db
+    # for every known profile and is deliberately not stopped above, so on
+    # Windows its open handles make the rmtree below fail with WinError 32
+    # (#88347). When this delete runs inside serve (the DELETE
+    # /api/profiles/<name> route) the handles live in this process and are
+    # closed here; from the CLI this finds nothing and is a no-op.
+    try:
+        from plugins.memory.holographic.store import MemoryStore as _MemoryStore
 
-        # 3. Remove wrapper script
-        if has_wrapper:
-            if remove_wrapper_script(canon):
-                print(f"✓ Removed {wrapper_path}")
+        _released = _MemoryStore.release_all_under(profile_dir)
+        if _released:
+            print(f"✓ Released {_released} memory-store connection(s) held by this process")
+    except Exception:
+        pass  # best-effort: never block the delete on the release path
 
-        # 4. Remove profile directory
-        remove_error: Exception | None = None
-        try:
-            def _make_writable(func, path, exc):
-                """onexc/onerror handler: add +w on PermissionError so rmtree can proceed.
+    # 3. Remove wrapper script
+    if has_wrapper:
+        if remove_wrapper_script(canon):
+            print(f"✓ Removed {wrapper_path}")
 
-                Handles two cases on NixOS (and other systems with read-only
-                copies from immutable stores):
-                1. The path itself isn't writable (e.g. a file with mode 0444)
-                2. The *parent* directory isn't writable (e.g. mode 0555)
+    # 4. Remove profile directory
+    remove_error: Exception | None = None
+    try:
+        def _make_writable(func, path, exc):
+            """onexc/onerror handler: add +w on PermissionError so rmtree can proceed.
 
-                Compatible with both the ``onexc`` API (3.12+, receives an
-                exception instance) and the ``onerror`` API (3.11-, receives
-                ``sys.exc_info()`` tuple).
-                """
-                import stat as _stat
+            Handles two cases on NixOS (and other systems with read-only
+            copies from immutable stores):
+            1. The path itself isn't writable (e.g. a file with mode 0444)
+            2. The *parent* directory isn't writable (e.g. mode 0555)
 
-                # Normalise the two callback signatures:
-                #   onexc(func, path, exc_instance)   — 3.12+
-                #   onerror(func, path, exc_info_tuple) — 3.11
-                if isinstance(exc, tuple):
-                    exc = exc[1]  # exc_info → actual exception object
+            Compatible with both the ``onexc`` API (3.12+, receives an
+            exception instance) and the ``onerror`` API (3.11-, receives
+            ``sys.exc_info()`` tuple).
+            """
+            import stat as _stat
 
-                if isinstance(exc, PermissionError):
-                    # Make the path writable
+            # Normalise the two callback signatures:
+            #   onexc(func, path, exc_instance)   — 3.12+
+            #   onerror(func, path, exc_info_tuple) — 3.11
+            if isinstance(exc, tuple):
+                exc = exc[1]  # exc_info → actual exception object
+
+            if isinstance(exc, PermissionError):
+                # Make the path writable
+                try:
+                    os.chmod(path, os.stat(path).st_mode | _stat.S_IWUSR)
+                except OSError:
+                    pass
+                # Also make the parent writable (needed for unlink/rmdir)
+                parent = os.path.dirname(path)
+                if parent:
                     try:
-                        os.chmod(path, os.stat(path).st_mode | _stat.S_IWUSR)
+                        os.chmod(parent, os.stat(parent).st_mode | _stat.S_IWUSR)
                     except OSError:
                         pass
-                    # Also make the parent writable (needed for unlink/rmdir)
-                    parent = os.path.dirname(path)
-                    if parent:
-                        try:
-                            os.chmod(parent, os.stat(parent).st_mode | _stat.S_IWUSR)
-                        except OSError:
-                            pass
-                    func(path)
-                else:
-                    raise
+                func(path)
+            else:
+                raise
 
-            _rmtree_with_retry(profile_dir, _make_writable)
-            print(f"✓ Removed {profile_dir}")
-        except Exception as e:
-            print(f"⚠ Could not remove {profile_dir}: {e}")
-            remove_error = e
+        _rmtree_with_retry(profile_dir, _make_writable)
+        print(f"✓ Removed {profile_dir}")
+    except Exception as e:
+        print(f"⚠ Could not remove {profile_dir}: {e}")
+        remove_error = e
 
     # 5. Clear active_profile if it pointed to this profile
     try:
@@ -2154,23 +2140,6 @@ def _default_export_ignore(root_dir: Path):
     return _ignore
 
 
-def _make_profile_archive(base: str, root_dir: str, base_dir: str) -> str:
-    """Create ``<base>.tar.gz`` of ``root_dir/base_dir`` — GNU tar format.
-
-    Not :func:`shutil.make_archive`: that writes PAX (Python's tarfile default
-    since 3.8), whose fractional-mtime records macOS Archive Utility rejects —
-    double-clicking an exported profile threw "Error 94 - Bad message." GNU
-    format keeps long paths working (longlink extensions) and stays integer-
-    mtime, so Finder, bsdtar, and gnutar all extract it.
-    """
-    import tarfile
-
-    archive_path = f"{base}.tar.gz"
-    with tarfile.open(archive_path, "w:gz", format=tarfile.GNU_FORMAT) as tf:
-        tf.add(str(Path(root_dir) / base_dir), arcname=base_dir)
-    return archive_path
-
-
 # Text / config suffixes walked during export secret scrubbing. Binary DBs,
 # images, and other non-text artifacts are left alone (they may still leave
 # via named-profile export — scrubbing those is a separate concern).
@@ -2269,7 +2238,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
 
     def _stage_extras(staged: Path) -> None:
         for rel, content in (extra_files or {}).items():
-            parts = _normalize_profile_archive_parts(rel)
+            parts = normalize_archive_parts(rel)
             target = staged.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
@@ -2288,7 +2257,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             )
             _stage_extras(staged)
             _scrub_export_secrets(staged)
-            result = _make_profile_archive(base, tmpdir, "default")
+            result = make_targz(base, tmpdir, "default")
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
@@ -2303,85 +2272,8 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         )
         _stage_extras(staged)
         _scrub_export_secrets(staged)
-        result = _make_profile_archive(base, tmpdir, canon)
+        result = make_targz(base, tmpdir, canon)
         return Path(result)
-
-
-def _normalize_profile_archive_parts(member_name: str) -> List[str]:
-    """Return safe path parts for a profile archive member."""
-    normalized_name = member_name.replace("\\", "/")
-    posix_path = PurePosixPath(normalized_name)
-    windows_path = PureWindowsPath(member_name)
-
-    if (
-        not normalized_name
-        or posix_path.is_absolute()
-        or windows_path.is_absolute()
-        or windows_path.drive
-    ):
-        raise ValueError(f"Unsafe archive member path: {member_name}")
-
-    parts = [part for part in posix_path.parts if part not in {"", "."}]
-    if not parts or any(part == ".." for part in parts):
-        raise ValueError(f"Unsafe archive member path: {member_name}")
-    return parts
-
-
-def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
-    """Extract a profile archive without allowing path escapes or links."""
-    import tarfile
-
-    with tarfile.open(archive, "r:gz") as tf:
-        for member in tf.getmembers():
-            parts = _normalize_profile_archive_parts(member.name)
-            target = destination.joinpath(*parts)
-
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-
-            if not member.isfile():
-                raise ValueError(
-                    f"Unsupported archive member type: {member.name}"
-                )
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            extracted = tf.extractfile(member)
-            if extracted is None:
-                raise ValueError(f"Cannot read archive member: {member.name}")
-
-            with extracted, open(target, "wb") as dst:
-                shutil.copyfileobj(extracted, dst)
-
-            try:
-                os.chmod(target, member.mode & 0o777)
-            except OSError:
-                pass
-
-
-def _inspect_profile_archive_roots(archive: Path) -> set[str]:
-    """Return the archive's top-level directory names.
-
-    Profile imports expect exactly one root directory. Inspecting the archive
-    before extraction lets us stage the import safely instead of mutating a
-    live profile tree first and reconciling names later.
-    """
-    import tarfile
-
-    with tarfile.open(archive, "r:gz") as tf:
-        top_dirs = {
-            parts[0]
-            for member in tf.getmembers()
-            for parts in [_normalize_profile_archive_parts(member.name)]
-            if len(parts) > 1 or member.isdir()
-        }
-        if not top_dirs:
-            top_dirs = {
-                _normalize_profile_archive_parts(member.name)[0]
-                for member in tf.getmembers()
-                if member.isdir()
-            }
-    return top_dirs
 
 
 def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
@@ -2396,7 +2288,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     if not archive.exists():
         raise FileNotFoundError(f"Archive not found: {archive}")
 
-    top_dirs = _inspect_profile_archive_roots(archive)
+    top_dirs = archive_root_dirs(archive)
     archive_root = top_dirs.pop() if len(top_dirs) == 1 else None
     inferred_name = name or archive_root
     if not inferred_name:
@@ -2429,7 +2321,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 
     with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
         staging_root = Path(tmpdir)
-        _safe_extract_profile_archive(archive, staging_root)
+        safe_extract_targz(archive, staging_root)
 
         extracted = staging_root / archive_root
         if not extracted.is_dir():
@@ -2609,17 +2501,7 @@ def resolve_profile_env(profile_name: str) -> str:
         return str(root)
     profile_dir = root / "profiles" / canon
 
-    # This is the explicit ``--profile`` startup boundary.  The directory can
-    # still exist while another process holds the deletion lease, and a stale
-    # launcher may have recreated a skeleton after a completed delete.  Refuse
-    # both states before callers install this path as HERMES_HOME.
-    if profile_deletion_blocks_start(profile_dir):
-        raise FileNotFoundError(
-            f"Profile '{canon}' is being deleted or was deleted. "
-            f"Create it explicitly before using it."
-        )
-
-    if not profile_dir.is_dir():
+    if not profile_dir.is_dir() or named_profile_is_deleted(profile_dir):
         raise FileNotFoundError(
             f"Profile '{canon}' does not exist. "
             f"Create it with: hermes profile create {canon}"

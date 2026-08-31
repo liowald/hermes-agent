@@ -6,7 +6,6 @@ import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
   dispatchConnectionScopedProfileDelete,
-  externalProfileDeletionActive,
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
@@ -143,72 +142,6 @@ test('assertLocalProfileCanStart rejects a delayed retry after the profile direc
   assert.throws(() => assertLocalProfileCanStart('selena', gate, () => false), /Profile "selena" no longer exists/)
   assert.doesNotThrow(() => assertLocalProfileCanStart('default', gate, () => false))
   assert.doesNotThrow(() => assertLocalProfileCanStart('selena', gate, profile => profile === 'selena'))
-})
-
-test('assertLocalProfileCanStart rejects a CLI deletion lease before the directory disappears', () => {
-  const gate = new ProfileDeletionGate()
-
-  assert.throws(
-    () =>
-      assertLocalProfileCanStart(
-        'selena',
-        gate,
-        () => true,
-        () => true
-      ),
-    /Profile "selena" is being deleted/
-  )
-})
-
-test('externalProfileDeletionActive follows active owners and preserves completed tombstones', () => {
-  assert.equal(
-    externalProfileDeletionActive(
-      'selena',
-      () => null,
-      () => true
-    ),
-    false
-  )
-  assert.equal(
-    externalProfileDeletionActive(
-      'selena',
-      () => 'deleting:4242',
-      pid => pid === 4242
-    ),
-    true
-  )
-  assert.equal(
-    externalProfileDeletionActive(
-      'selena',
-      () => 'deleting:4242',
-      () => false
-    ),
-    false
-  )
-  assert.equal(
-    externalProfileDeletionActive(
-      'selena',
-      () => 'deleted',
-      () => false
-    ),
-    true
-  )
-  assert.equal(
-    externalProfileDeletionActive(
-      'selena',
-      () => 'not-a-pid',
-      () => false
-    ),
-    true
-  )
-  assert.equal(
-    externalProfileDeletionActive(
-      'default',
-      () => 'deleted',
-      () => true
-    ),
-    false
-  )
 })
 
 test('localProfilePoolKeys returns every local process scope for one profile', () => {
