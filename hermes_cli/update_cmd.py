@@ -82,6 +82,11 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli",
         "hermes_cli.main",
         "hermes_cli.update_cmd",
+        # The updater starts a receipt before a pull and finalizes it after
+        # the restart phase. Purging this module discards its in-memory
+        # receipt, leaving an older failed latest.json to trigger endless
+        # no-op catch-up restarts.
+        "hermes_cli.update_receipt",
         "hermes_cli.hermes_logging",
     }
 )

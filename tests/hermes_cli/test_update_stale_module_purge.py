@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli import update_receipt
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +81,20 @@ def test_purge_protects_executing_modules():
     assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
     assert sys.modules.get("hermes_cli.main") is cli_main
     assert "hermes_cli" in sys.modules
+
+
+def test_purge_preserves_active_update_receipt(monkeypatch, tmp_path):
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: tmp_path)
+    update_receipt.begin_update_receipt()
+    active_receipt = update_receipt._current
+
+    cli_main._purge_stale_hermes_modules()
+
+    assert sys.modules.get("hermes_cli.update_receipt") is update_receipt
+    assert update_receipt._current is active_receipt
+    receipt_path = update_receipt.finalize_update_receipt("success")
+    assert receipt_path is not None
+    assert receipt_path.is_file()
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
