@@ -5,10 +5,10 @@ A plugin-based gateway adapter that connects to a Buzz community relay
 (Block's open-source human+agent collaboration platform, built on the
 Nostr protocol) and relays messages to/from the Hermes agent.
 
-The adapter does not speak Nostr itself — it shells out to the ``buzz``
-CLI binary ("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.
-Inbound delivery uses a poll loop (the CLI is request/response); see the
-"Known limitations" note in the platform docs.
+Outbound delivery shells out to the ``buzz`` CLI binary ("JSON in, JSON
+out") via ``asyncio.create_subprocess_exec``. Inbound delivery prefers a
+native NIP-42-authenticated Nostr WebSocket subscription, with CLI polling
+as the fallback.
 
 Configuration in config.yaml::
 
@@ -21,15 +21,16 @@ Configuration in config.yaml::
             channels:                  # channel UUIDs to watch (empty = all joined)
               - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
+            transport: auto            # websocket with poll fallback
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
 
 Or via environment variables (overrides config.yaml):
-    BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
-    BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_TRANSPORT,
+    BUZZ_POLL_INTERVAL, BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE,
+    BUZZ_ALLOWED_USERS, BUZZ_ALLOW_ALL_USERS, BUZZ_AUTH_TAG
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -379,7 +380,7 @@ def _parse_json_list(stdout: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 class BuzzAdapter(BasePlatformAdapter):
-    """Poll-based Buzz adapter implementing the BasePlatformAdapter interface.
+    """Buzz messaging adapter implementing the BasePlatformAdapter interface.
 
     Instantiated by the adapter_factory passed to register_platform().
     """
@@ -487,7 +488,7 @@ class BuzzAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Verify relay credentials, seed high-water marks, start polling."""
+        """Verify credentials, seed high-water marks, and start inbound transport."""
         if not self.relay_url:
             logger.error("Buzz: relay URL must be configured")
             self._set_fatal_error("config_missing", "BUZZ_RELAY_URL must be set", retryable=False)
